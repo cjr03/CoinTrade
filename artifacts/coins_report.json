@@ -1,0 +1,136 @@
+{
+ "BTC": {
+  "start": "2019-01-01",
+  "end": "2026-10-20",
+  "trend": {
+   "final": 3110.5545,
+   "total_ret": 30.1055,
+   "cagr": 0.5531,
+   "sharpe": 1.2265,
+   "sortino": 1.7486,
+   "max_dd": -0.583,
+   "round_trips": 75,
+   "round_trips_per_year": 9.6058
+  },
+  "hold": {
+   "final": 2224.0131,
+   "total_ret": 21.3294,
+   "cagr": 0.4885,
+   "sharpe": 0.9493,
+   "sortino": 1.3486,
+   "max_dd": -0.7722
+  }
+ },
+ "ETH": {
+  "start": "2019-01-01",
+  "end": "2026-10-20",
+  "trend": {
+   "final": 2224.4234,
+   "total_ret": 21.2442,
+   "cagr": 0.4878,
+   "sharpe": 0.9945,
+   "sortino": 1.3982,
+   "max_dd": -0.5874,
+   "round_trips": 76,
+   "round_trips_per_year": 9.7339
+  },
+  "hold": {
+   "final": 1842.6605,
+   "total_ret": 17.5006,
+   "cagr": 0.4531,
+   "sharpe": 0.8693,
+   "sortino": 1.2196,
+   "max_dd": -0.8138
+  }
+ },
+ "SOL": {
+  "start": "2021-08-16",
+  "end": "2026-10-20",
+  "trend": {
+   "final": 665.9198,
+   "total_ret": 5.6592,
+   "cagr": 0.4419,
+   "sharpe": 0.8809,
+   "sortino": 1.295,
+   "max_dd": -0.7296,
+   "round_trips": 54,
+   "round_trips_per_year": 10.4226
+  },
+  "hold": {
+   "final": 153.8243,
+   "total_ret": 0.5444,
+   "cagr": 0.0875,
+   "sharpe": 0.5806,
+   "sortino": 0.8425,
+   "max_dd": -0.968
+  }
+ },
+ "XRP": {
+  "start": "2023-09-11",
+  "end": "2026-10-20",
+  "trend": {
+   "final": 155.9049,
+   "total_ret": 0.559,
+   "cagr": 0.1535,
+   "sharpe": 0.5363,
+   "sortino": 0.7726,
+   "max_dd": -0.7192,
+   "round_trips": 44,
+   "round_trips_per_year": 14.1508
+  },
+  "hold": {
+   "final": 280.4587,
+   "total_ret": 1.8159,
+   "cagr": 0.3951,
+   "sharpe": 0.8154,
+   "sortino": 1.1857,
+   "max_dd": -0.7295
+  }
+ },
+ "_portfolios": {
+  "start": "2023-09-11",
+  "end": "2026-10-20",
+  "mixes": {
+   "BTC trend only": {
+    "final": 262.769,
+    "total_ret": 1.6277,
+    "cagr": 0.3644,
+    "sharpe": 1.1028,
+    "sortino": 1.5848,
+    "max_dd": -0.3226
+   },
+   "BTC+ETH trend": {
+    "final": 273.198,
+    "total_ret": 1.732,
+    "cagr": 0.3816,
+    "sharpe": 1.1324,
+    "sortino": 1.6085,
+    "max_dd": -0.3855
+   },
+   "all 4 trend": {
+    "final": 249.29,
+    "total_ret": 1.4929,
+    "cagr": 0.3415,
+    "sharpe": 0.8884,
+    "sortino": 1.2382,
+    "max_dd": -0.5032
+   },
+   "all 4 hold": {
+    "final": 343.9599,
+    "total_ret": 2.4396,
+    "cagr": 0.4878,
+    "sharpe": 0.9268,
+    "sortino": 1.3087,
+    "max_dd": -0.6876
+   },
+   "BTC hold only": {
+    "final": 329.7859,
+    "total_ret": 2.2979,
+    "cagr": 0.4678,
+    "sharpe": 1.0574,
+    "sortino": 1.5002,
+    "max_dd": -0.5385
+   }
+  }
+ }
+}

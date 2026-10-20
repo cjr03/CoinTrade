@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="btcbot-token" content="__TOKEN__">
+<title>Phosphor Desk</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=VT323&display=swap">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="crt" id="crt">
+
+  <div class="crawl" role="marquee" aria-label="Model notes">
+    <span class="crawl-tag">model</span>
+    <div class="crawl-window"><div class="crawl-track" id="crawl"></div></div>
+  </div>
+
+  <header class="quote">
+    <div class="instrument">
+      <span class="pair" id="pair">btc/usd</span>
+      <span class="venue" id="venue">connecting</span>
+    </div>
+    <div class="readout">
+      <output class="price" id="price" aria-live="off">—</output>
+      <span class="chg" id="chg"></span>
+    </div>
+    <dl class="stats">
+      <div><dt>bid</dt><dd id="bid">—</dd></div>
+      <div><dt>ask</dt><dd id="ask">—</dd></div>
+      <div><dt>24h high</dt><dd id="hi">—</dd></div>
+      <div><dt>24h low</dt><dd id="lo">—</dd></div>
+    </dl>
+    <nav class="coins" id="coins" role="tablist" aria-label="Coin"></nav>
+    <nav class="keys" role="tablist" aria-label="Chart range">
+      <button role="tab" data-view="10m">10m</button>
+      <button role="tab" data-view="1h" aria-selected="true">1h</button>
+      <button role="tab" data-view="1d">1d</button>
+      <button role="tab" data-view="1w">1w</button>
+    </nav>
+    <div class="lamps">
+      <span class="lamp" id="lamp-feed" title="Live price feed">feed</span>
+      <span class="lamp" id="lamp-bot" title="Automatic trading">bot</span>
+      <span class="lamp" id="lamp-mode" title="Paper or live money">paper</span>
+    </div>
+  </header>
+
+  <main class="desk">
+    <section class="win chart-win" aria-label="Price chart">
+      <h2 class="win-title"><span id="chart-title">last hour</span><span class="win-sub" id="chart-sub"></span></h2>
+      <canvas id="chart"></canvas>
+      <div class="hud" id="hud" hidden></div>
+    </section>
+
+    <aside class="side">
+      <section class="win" aria-label="Account">
+        <h2 class="win-title">portfolio</h2>
+        <div class="equity"><output id="equity">—</output><span id="pnl"></span></div>
+        <p class="breakdown" id="breakdown"></p>
+        <table class="markets" aria-label="Live markets and holdings">
+          <thead><tr><th scope="col">coin</th><th scope="col">price</th><th scope="col">24h</th><th scope="col">held</th></tr></thead>
+          <tbody id="markets"></tbody>
+        </table>
+        <dl class="kv">
+          <div><dt id="sleeve-label">btc trend sleeve</dt><dd id="sleeve-eq">—</dd></div>
+          <div><dt>sleeve cash</dt><dd id="cash">—</dd></div>
+          <div><dt id="qty-label">bitcoin</dt><dd id="btc">—</dd></div>
+          <div><dt>position</dt><dd id="pos">flat</dd></div>
+          <div><dt>stop</dt><dd id="stop">—</dd></div>
+          <div><dt>paid in fees</dt><dd id="fees">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="win model-win" aria-label="Model">
+        <h2 class="win-title">model <span class="win-sub" id="model-name"></span></h2>
+        <p class="verdict" id="verdict">waiting for the first signal</p>
+        <div class="gauge" id="gauge" aria-hidden="true">
+          <div class="gauge-scale"></div>
+          <div class="gauge-mark exit" id="g-exit"></div>
+          <div class="gauge-mark entry" id="g-entry"></div>
+          <div class="gauge-needle" id="g-needle"></div>
+        </div>
+        <div class="gauge-legend"><span id="g-lo"></span><span id="g-mid"></span><span id="g-hi"></span></div>
+        <dl class="kv">
+          <div><dt>next decision</dt><dd id="countdown">—</dd></div>
+          <div><dt>round trip cost</dt><dd id="cost">—</dd></div>
+          <div><dt>go-live gate</dt><dd id="gate">—</dd></div>
+        </dl>
+      </section>
+
+      <section class="win fills-win" aria-label="Recent fills">
+        <h2 class="win-title">fills</h2>
+        <ol class="fills" id="fills"><li class="empty">no trades yet</li></ol>
+      </section>
+    </aside>
+
+    <section class="win console-win" aria-label="Console">
+      <h2 class="win-title">console</h2>
+      <div class="console" id="console" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <form class="prompt" id="prompt" autocomplete="off">
+    <label for="cmd" class="prompt-sigil">&gt;</label>
+    <input id="cmd" name="cmd" spellcheck="false" autocapitalize="off" placeholder="buy 25 eth · sell all · move 20 btc sol · help">
+    <span class="prompt-hint" id="hint"></span>
+  </form>
+</div>
+
+<div class="boot" id="boot" aria-hidden="true"><pre id="boot-text"></pre></div>
+<script src="/app.js"></script>
+</body>
+</html>

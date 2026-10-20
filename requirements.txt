@@ -1,0 +1,14 @@
+numpy>=2.5
+pandas>=3.0
+pyarrow>=26.0
+scikit-learn>=1.9
+lightgbm>=4.7
+requests>=2.34
+certifi>=2026.10
+coinbase-advanced-py>=1.8
+textual>=8.2
+rich>=15.0
+websockets>=13.1
+pytest>=9.1
+# optional, only for btcbot.chronos_eval (zero-shot foundation-model challenger):
+# torch chronos-forecasting

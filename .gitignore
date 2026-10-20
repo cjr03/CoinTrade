@@ -1,0 +1,22 @@
+# secrets and live account state — never commit
+.env
+state/
+# local environment and tool caches
+.venv/
+__pycache__/
+.pytest_cache/
+.playwright-mcp/
+.remember/
+.claude/settings.local.json
+.DS_Store
+# downloaded market data and regenerable research outputs
+data/
+artifacts/*
+!artifacts/policy*.json
+!artifacts/report_*.json
+!artifacts/coins_report.json
+# model pickles are rebuilt locally (python -m btcbot.train --final, python -m btcbot.bets --train);
+# never load a pickle you did not produce yourself
+*.pkl
+*.log
+*.parquet
