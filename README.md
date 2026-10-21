@@ -52,7 +52,7 @@ trades a strategy that survives out-of-sample.
 
 ## Demo
 
-**Terminal desk** (`./tui.sh`): live price, the model's projection cone, the portfolio across all four coins, and clickable command chips.
+**Terminal desk** (`./tui.sh`): live price, the forecast fan (median with 50% and 80% bands), coin cards with 15-minute odds next to Kalshi's, the bets panel, and clickable command chips.
 
 <img src="docs/tui.png" width="800px">
 
@@ -216,6 +216,12 @@ http://127.0.0.1:8787
 ```bash
 ./tui.sh            # attaches to the running bot
 ./tui.sh --start    # or hosts a bot inside this terminal session
+```
+8. Keep it running (optional, macOS)
+```bash
+./service.sh install        # run the live bot in the background: starts at login, restarts if it crashes
+sudo ./keepawake.sh on      # stay awake with the lid closed (keep it plugged in); 'off' to undo
+./service.sh status         # service + lid setting;  ./service.sh uninstall to remove
 ```
 
 ---

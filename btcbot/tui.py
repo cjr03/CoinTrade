@@ -22,7 +22,7 @@ import requests
 from rich.style import Style
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.widgets import Input, RichLog, Static
 
@@ -496,7 +496,7 @@ Screen {{ background: {GLASS}; color: {AMBER}; }}
 #lamps {{ width: auto; }}
 #desk {{ height: 1fr; }}
 #left {{ width: 1fr; }}
-#side {{ width: 38; }}
+#side {{ width: 39; scrollbar-size-vertical: 1; scrollbar-color: {DIM_AMBER}; scrollbar-background: {GLASS}; }}
 .win {{ border: round {DIM_AMBER}; border-title-color: {AMBER}; border-title-style: bold; padding: 0 1; background: {GLASS}; }}
 .model-win {{ border: round #2f6f75; border-title-color: {CYAN}; }}
 #chart-win {{ height: 1fr; padding: 0; }}
@@ -508,7 +508,7 @@ Screen {{ background: {GLASS}; color: {AMBER}; }}
 #account {{ height: auto; }}
 #model {{ height: auto; }}
 #calls {{ height: auto; }}
-#fills-win {{ height: 1fr; }}
+#fills-win {{ height: auto; min-height: 4; }}
 #prompt {{ height: 3; border: round {AMBER}; background: #030b10; color: {HOT}; padding: 0 1; }}
 #prompt:focus {{ border: round {HOT}; }}
 #prompt.pending {{ border: round {EMBER}; }}
@@ -577,7 +577,7 @@ class Desk(App):
                         yield RichLog(id="console", wrap=True, markup=False, max_lines=500, min_width=20)
                     with Vertical(id="bets-win", classes="win"):
                         yield Static(id="bets")
-            with Vertical(id="side"):
+            with VerticalScroll(id="side"):  # scrolls when the panels are taller than the terminal
                 yield Static(id="account", classes="win")
                 yield Static(id="model", classes="win model-win")
                 yield Static(id="calls", classes="win model-win")
@@ -971,7 +971,7 @@ class Desk(App):
         f = Text()
         for x in reversed(self.fills[-12:]):
             f.append(f"{x['side']:<5}", style=f"bold {EMBER}" if x["side"] == "sell" else f"bold {CYAN}")
-            f.append(f"{x['coin'].lower():<4}{x['size']:<10.4g}@ {pxr(x['price']):<8}", style=AMBER)
+            f.append(f"{x['coin'].lower():<4}{x['size']:<9.4g}@ {pxr(x['price']):<8}", style=AMBER)
             f.append(f" {hhmm(x['t'])}\n", style=DIM)
         self.query_one("#fills").update(f if self.fills else Text("no trades yet", style=DIM))
 
@@ -1060,12 +1060,12 @@ class Desk(App):
             n += r.get("n") or 0; hits += r.get("hits") or 0; net += r.get("net_bp") or 0
             if (k.get("tested") or {}).get("hit_rate") is not None:
                 tested.append(k["tested"])
-        t.append("% = chance it ends the 15 min higher\nthan it started · K = Kalshi's odds\n", style=DIM)
+        t.append("% = chance it ends above its start\nK = Kalshi's odds\n", style=DIM)
         if n:
-            t.append(f"• model's opening calls: {hits} of {n} right\n", style=DIM)
+            t.append(f"• opening calls: {hits} of {n} right\n", style=DIM)
         if tested:
             hr = sum(x["hit_rate"] for x in tested) / len(tested)
-            t.append(f"tested: right {hr:.0%}, lost money after fees\n", style=DIM)
+            t.append(f"tested: {hr:.0%} right, lost to fees\n", style=DIM)
         t.append("information only; never traded", style=DIM)
         box.update(t)
 

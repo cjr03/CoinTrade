@@ -34,6 +34,7 @@ body {
   position: relative;
   display: grid;
   grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr);  /* never wider than the window, whatever a child's content */
   height: 100vh;
   height: 100dvh;
   padding: 0 14px 12px;
@@ -74,7 +75,7 @@ body {
   text-shadow: none;
   box-shadow: var(--glow-cyan);
 }
-.crawl-window { position: relative; flex: 1; overflow: hidden; }
+.crawl-window { position: relative; flex: 1; min-width: 0; overflow: hidden; }
 .crawl-track {
   position: absolute;
   top: 0; bottom: 0;
@@ -474,7 +475,8 @@ dd { margin: 0; font-variant-numeric: tabular-nums; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .crawl-track { animation: none; padding-left: 0; flex-wrap: nowrap; overflow-x: auto; position: static; }
+  .crawl-track { animation: none; padding-left: 0; flex-wrap: nowrap; position: static; height: 100%; }
+  .crawl-window { overflow-x: auto; scrollbar-width: none; }  /* reduced motion: the notes scroll by hand instead */
   .crt.powering { animation: none; }
   .lamp.busy { animation: none; }
   .gauge-needle, .gauge-mark, .price, .tape-glow, .alloc span, .bet .fill, .watch .lvl { transition: none; }
