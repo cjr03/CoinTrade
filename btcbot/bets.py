@@ -6,6 +6,10 @@ calibrated direction model is confident enough.
 Every out-of-sample test in this project says these bets lose money after Kraken's fees (README);
 they run because the owner asked for them, so they are fenced in:
   * the pool trades only its own cash (funded with `move 15 btc bets`); trend sleeves never see it,
+  * when a bet fires and the pool is short of cash, it may raise the stake from the sleeves (idle cash
+    first, then selling another coin; 'bets fund off' stops this), but never past a lifetime cap on
+    what the pool has been given (BTCBOT_BET_MAX_SHARE, default 25% of the portfolio), so losses are
+    not refilled automatically,
   * one bet per coin at a time, stake <= half the pool, a 2-sigma stop on every bet,
   * the pool halts itself when its equity falls BETS_POOL_STOP (default 50%) below what was put in.
 Bets are LONG-ONLY by default. Short bets (Kraken 2:1 margin, BTCBOT_BET_SHORTS=1 or 'bets shorts on')
@@ -176,6 +180,7 @@ class BetPool:
         self.s.setdefault("committed", {})  # stake reserved for orders in flight, per coin
         self.s.setdefault("auto", True)
         self.s.setdefault("shorts", False)
+        self.s.setdefault("autofund", True)
         if self.live and os.environ.get("BTCBOT_BET_SHORTS") != "1":
             self.s["shorts"] = False  # live margin shorts need an explicit opt-in
         stale = {k: v for k, v in self.s.get("committed", {}).items() if v}
@@ -189,6 +194,7 @@ class BetPool:
         self.sink = sink
         self.reserved_elsewhere = reserved_elsewhere  # cash booked to the trend sleeves
         self.stop_frac = float(os.environ.get("BTCBOT_BETS_POOL_STOP", 0.5))
+        self.funder = None  # set by Portfolio: (bet coin, dollars wanted) -> dollars added, or raises with why not
         self.models = {}
         for c in self.coins:
             # bets_<COIN>.pkl is produced locally by `python -m btcbot.bets --train`; never load one from elsewhere
@@ -335,11 +341,14 @@ class BetPool:
         if side:
             self._open(coin, side, sig, bid, ask)
 
+    def _target(self, coin):
+        """The stake a bet wants before cash limits: half the pool, at least the exchange minimum."""
+        pool_eq = self.ledger["usd"] + sum(b["stake"] for b in self.s["bets"].values() if b["side"] > 0)
+        return min(max(self.brokers[coin].min_order_usd * 1.1, pool_eq * 0.5), self.brokers[coin].max_notional)
+
     def _stake(self, coin):
         with self.lock:
-            pool_eq = self.ledger["usd"] + sum(b["stake"] for b in self.s["bets"].values() if b["side"] > 0)
-            stake = min(self.free_usd(), max(self.brokers[coin].min_order_usd * 1.1, pool_eq * 0.5))
-            stake = min(stake, self.brokers[coin].max_notional)
+            stake = min(self.free_usd(), self._target(coin))
             if self.live:
                 acct_total = self.brokers[coin].total_usd()
                 stake = min(stake, acct_total - self.reserved_elsewhere()
@@ -352,9 +361,20 @@ class BetPool:
             return stake
 
     def _open(self, coin, side, sig, bid, ask):
+        with self.lock:
+            short = self._target(coin) - self.free_usd()
+        why = f"bet pool too small for a {coin} bet; fund it with 'move 15 btc bets'"
+        if short > 0.01 and side > 0 and self.funder and self.s.get("autofund", True):
+            self.busy[coin] = "raising the stake"
+            try:
+                self.funder(coin, short)
+            except Exception as e:  # nothing was sold, or the sale is fully booked: just say why
+                why = f"no {coin} bet: {e}"
+            finally:
+                self.busy[coin] = None
         stake = self._stake(coin)
         if not stake:
-            self.journal(event="pool_skip", coin=coin, note=f"bet pool too small for a {coin} bet; fund it with 'move 15 btc bets'")
+            self.journal(event="pool_skip", coin=coin, note=why)
             return
         br = self.brokers[coin]
         self.busy[coin] = f"opening {'long' if side > 0 else 'short'}"

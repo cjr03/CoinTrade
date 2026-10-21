@@ -22,7 +22,7 @@ import requests
 
 from .coins import COINS, coin_symbol
 from .kraken import public as kraken_public
-from .trader import ART, Busy, configure
+from .trader import ART, STATE, Busy, configure
 
 WEB = Path(__file__).resolve().parent / "web"
 PORT = int(os.environ.get("BTCBOT_PORT", 8787))
@@ -292,6 +292,7 @@ HELP = [
     "convert 20 btc eth   sell $20 of btc and buy eth with it     convert all sol xrp",
     "rebalance btc 50 eth 30 sol 20   redistribute everything to those percentages",
     "bets            short-term bet pool status    bets on | off | resume | shorts on | shorts off",
+    "bets fund on    let a bet sell another coin for its stake (capped)    bets fund off: pool cash only",
     "coin sol        show solana         (or click the coin or its market row)",
     "bot off | on    pause or resume automatic trading (add 'all' for every coin)",
     "resume          re-arm after the kill switch or a review flag",
@@ -534,6 +535,14 @@ def bets_command(pf, arg):
     if arg == "resume":
         cleared = pool.resume()
         return {"lines": [f"bet pool: cleared {', '.join(cleared)}" if cleared else "bet pool: nothing to resume"]}
+    if arg in ("fund on", "fund off"):
+        with pool.lock:
+            pool.s["autofund"] = arg.endswith("on")
+            pool.journal(event="pool_autofund", on=pool.s["autofund"])
+            pool.save()
+        return {"lines": ["bets may now sell another coin (or use idle sleeve cash) for their stake, up to the "
+                          "pool's funding cap" if arg.endswith("on") else
+                          "bets will only use the pool's own cash"], "ok": True}
     if arg in ("shorts on", "shorts off"):
         with pool.lock:
             pool.s["shorts"] = arg.endswith("on")
@@ -551,7 +560,8 @@ def bets_command(pf, arg):
     basis = L["deposited"] - L["withdrawn"]
     lines = [f"bet pool ${eq:,.2f} (put in ${basis:,.2f}, realized {L['realized']:+.2f}, fees ${L['fees']:.2f})"
              f"{' HALTED' if st.get('halted') else ''}{' needs review' if st.get('needs_review') else ''}"
-             f", bets {'on' if st.get('auto', True) else 'off'}, shorts {'on' if st.get('shorts') else 'off'}"]
+             f", bets {'on' if st.get('auto', True) else 'off'}, shorts {'on' if st.get('shorts') else 'off'}"
+             f", funding from coins {'on' if st.get('autofund', True) else 'off'}"]
     for c, m in st["models"].items():
         b = st["bets"].get(c)
         v = m["validation"]
@@ -608,6 +618,8 @@ def execute(pf, a):
 # --- HTTP -------------------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     portfolio = None
+    caller = None  # 15-minute calls (btcbot.calls), when their models exist
+    forecaster = None  # chart forecast curves (btcbot.forecast), when their fits exist
     server_version = "btcbot"
 
     def log_message(self, fmt, *args):
@@ -673,8 +685,12 @@ class Handler(BaseHTTPRequestHandler):
                     st["pool"] = {"ledger": ps["ledger"], "bets": ps["bets"], "auto": ps.get("auto", True),
                                   "halted": ps.get("halted"), "needs_review": ps.get("needs_review"),
                                   "shorts": ps.get("shorts"), "signal": (ps.get("signals") or {}).get(coin),
-                                  "model": ps["models"].get(coin)}
+                                  "model": ps["models"].get(coin), "signals": ps.get("signals") or {},
+                                  "models": {c: {"H": m["H"], "threshold": m["threshold"]}
+                                             for c, m in ps["models"].items()},
+                                  "autofund": ps.get("autofund", True)}
                 st["portfolio"] = portfolio_value(pf)
+                st["calls"] = self.caller.snapshot() if self.caller else None
                 st["boot_id"] = BOOT_ID
                 pend = [(k, a) for k, a in PENDING.items() if time.time() - a["t"] <= 120]
                 st["pending"] = pend[0][0] if pend else None
@@ -686,6 +702,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "unknown view"}, 400)
                 ttl = {"10m": 5, "1h": 15, "1d": 60, "1w": 300}[view]
                 self._json(cached(f"c:{ex}:{coin}:{view}", ttl, lambda: candles(ex, view, coin)))
+            elif u.path == "/api/forecast":
+                coin = self._coin(q)
+                if not self.forecaster or coin not in self.forecaster.fits:
+                    return self._json({"error": "no forecast fit for this coin (python -m btcbot.forecast --fit)"}, 404)
+                self._json(cached(f"forecast:{coin}", 20, lambda: self.forecaster.curve(coin, model_leans(pf, coin, self.caller))))
             elif u.path == "/api/notes":
                 self._json(notes(pf, self._coin(q)))
             else:
@@ -718,11 +739,38 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"lines": [f"error: {e}"], "error": True})
 
 
+def model_leans(pf, coin, caller):
+    """What each model currently leans towards for `coin`, for the chart's forecast curve."""
+    leans = []
+    if caller:
+        call = caller.snapshot().get(coin) or {}
+        if call.get("p_up") is not None:
+            leans.append(("15m model", call["p_up"], 15))
+    # the bet model is left out: its validation lost money on every coin, so its P(up) isn't a forecast
+    sig = pf[coin].s.get("signal") or {}
+    if pf.policy.get("model") == "momentum" and sig.get("pred") is not None:
+        leans.append(("trend", "up" if sig["pred"] > 0 else "down", None))
+    return leans
+
+
 def serve(pf, port=PORT):
     """Start every coin's trader thread and the HTTP server thread; returns the stop event."""
     Handler.portfolio = pf
     stop = threading.Event()
     threading.Thread(target=pf.run, kwargs={"stop": stop}, daemon=True, name="portfolio").start()
+    try:  # 15-minute up/down calls: recommendations only, they never place an order
+        from .calls import Caller
+        caller = Caller(pf.coins, STATE)
+        if caller.models:
+            Handler.caller = caller
+            threading.Thread(target=caller.run, kwargs={"stop": stop}, daemon=True, name="calls").start()
+    except Exception:
+        log.exception("15-minute calls unavailable")
+    try:
+        from .forecast import Forecaster
+        Handler.forecaster = Forecaster(pf.coins)
+    except Exception:
+        log.exception("forecast curves unavailable")
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True, name="http").start()
     return stop, srv

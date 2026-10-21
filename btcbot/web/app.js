@@ -24,7 +24,11 @@ const S = {
   status: null, since: 0, allFills: [], hover: null, dirty: true, pending: null,
   history: [], histIdx: -1, ws: null, wsTickAt: 0, bootId: null, coin: "BTC", coins: [],
   live: {},  // coin -> {last, chg} from the all-coins WebSocket ticker
+  tapePx: {},  // coin -> last price painted on the tape (for the tick flash)
+  forecast: null,  // the selected coin's forecast curve (/api/forecast)
 };
+// allocation colours: the trend sleeves in amber shades, the bet pool in the model's cyan
+const ALLOC = { BTC: "#ffb547", ETH: "#ffd98c", SOL: "#c7862b", XRP: "#8f6a35", BETS: "#5fe3e8" };
 const SYM_TO_COIN = Object.fromEntries(Object.entries(COIN_META).flatMap(([c, m]) => [[m.ws, c], [m.product, c]]));
 try { S.coin = localStorage.getItem("btcbot.coin") || "BTC"; } catch (e) { /* private mode */ }
 const fillsFor = (c) => S.allFills.filter((f) => f.coin === c);
@@ -40,6 +44,86 @@ const dayLabel = (t) => new Date(t * 1000).toLocaleDateString("en-US", { weekday
 const pdec = (n) => (Math.abs(n) >= 1000 ? 1 : Math.abs(n) >= 10 ? 2 : 4);
 const px = (n) => num(n, pdec(n));
 const pxr = (n) => num(n, Math.abs(n) >= 1000 ? 0 : Math.abs(n) >= 10 ? 2 : 4);
+
+// count a number up/down to its new value instead of jumping (the eye follows the change)
+function tween(el, to, fmt, ms = 650) {
+  if (to == null || !isFinite(to)) { el.textContent = fmt(to); el._v = null; return; }
+  const from = el._v;
+  el._v = to;
+  if (reduced || from == null || Math.abs(from - to) < 1e-9) { el.textContent = fmt(to); return; }
+  const t0 = performance.now();
+  cancelAnimationFrame(el._raf);
+  const step = (now) => {
+    const k = Math.min(1, (now - t0) / ms), e = 1 - Math.pow(1 - k, 3);
+    el.textContent = fmt(from + (to - from) * e);
+    if (k < 1) el._raf = requestAnimationFrame(step);
+  };
+  el._raf = requestAnimationFrame(step);
+}
+function flash(el, up) {
+  if (reduced) return;
+  el.classList.remove("tick-up", "tick-down"); void el.offsetWidth; el.classList.add(up ? "tick-up" : "tick-down");
+}
+const dur = (sec) => { sec = Math.max(0, sec); const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${m}m`; };
+
+// live odds for a 15-minute window: same formula as btcbot.calls.live_odds (constants come with each call)
+function erf(x) {  // Abramowitz-Stegun 7.1.26, |error| < 1.5e-7
+  const s = Math.sign(x); x = Math.abs(x);
+  const k = 1 / (1 + 0.3275911 * x);
+  return s * (1 - ((((1.061405429 * k - 1.453152027) * k + 1.421413741) * k - 0.284496736) * k + 0.254829592) * k * Math.exp(-x * x));
+}
+const Phi = (x) => 0.5 * (1 + erf(x / Math.SQRT2));
+const tauEff = (remS) => { const r = remS / 60; return r > 1 ? r - 2 / 3 : r ** 3 / 3; };  // 60-second settlement average
+function liveOdds(call, price, now = Date.now() / 1000) {
+  if (!call || !call.start || !price || !(call.sigma1m > 0)) return null;
+  const t0 = Date.parse(call.from) / 1000, t1 = Date.parse(call.until) / 1000, rem = t1 - now;
+  if (rem <= 0) return price >= call.start ? 1 : 0;
+  const frac = Math.min(rem / (t1 - t0), 1);
+  const z = Math.log(price / call.start) / (call.sigma1m * Math.sqrt(tauEff(rem)));
+  return Math.min(0.98, Math.max(0.02, Phi(((call.a0 ?? 1) + (call.a1 ?? 0) * frac) * z + (call.z0 || 0) * Math.sqrt(frac))));
+}
+// Kalshi's live "yes" (up) price for the same window, in cents
+function kalshiCents(call) {
+  const k = call && call.kalshi;
+  if (!k || k.from !== call.from.replace("+00:00", "Z") && Date.parse(k.from) !== Date.parse(call.from)) return null;
+  const mid = k.yes_bid != null && k.yes_ask != null ? (k.yes_bid + k.yes_ask) / 2 : k.last;
+  return mid == null ? null : Math.round(mid * 100);
+}
+function coinPrice(c) {
+  const lv = S.live[c], row = ((S.status && S.status.portfolio && S.status.portfolio.coins) || {})[c] || {};
+  return lv && Date.now() - lv.at < 15000 ? lv.last : row.last;
+}
+// a 15-minute chance of "up" in words
+const verdict = (p) => p >= 0.8 ? "very likely higher" : p >= 0.6 ? "likely higher" : p > 0.4 ? "a toss-up"
+  : p > 0.2 ? "likely lower" : "very likely lower";
+const mmss = (sec) => { sec = Math.max(0, Math.floor(sec)); return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, "0")}s`; };
+
+// forecast curve: interpolate the server's horizons (minutes) on log-time; below the first, spread grows as sqrt(t)
+const FC_KEYS = ["mu", "q10", "q25", "q50", "q75", "q90"];
+function fcAt(f, h) {
+  const P = f.points;
+  if (!(h > 0)) return Object.fromEntries(FC_KEYS.map((k) => [k, 0]));
+  if (h <= P[0].h) {
+    const a = P[0], r = h / a.h, s = Math.sqrt(r);
+    return Object.fromEntries(FC_KEYS.map((k) => [k, a.mu * r + (a[k] - a.mu) * s]));
+  }
+  let i = 1;
+  while (i < P.length - 1 && P[i].h < h) i++;
+  const a = P[i - 1], b = P[i];
+  if (h >= b.h) return Object.fromEntries(FC_KEYS.map((k) => [k, b[k]]));
+  const w = (Math.log(h) - Math.log(a.h)) / (Math.log(b.h) - Math.log(a.h));
+  return Object.fromEntries(FC_KEYS.map((k) => [k, a[k] + (b[k] - a[k]) * w]));
+}
+const fmtAhead = (sec) => sec < 3600 ? `next ${Math.round(sec / 60)}m` : sec < 172800 ? `next ${(sec / 3600).toFixed(sec < 36000 ? 1 : 0)}h` : `next ${(sec / 86400).toFixed(1)}d`;
+async function loadForecast() {
+  clearTimeout(loadForecast.t);
+  try {
+    const coin = S.coin, f = await getJSON(`/api/forecast?coin=${coin}`);
+    if (coin === S.coin && f.points) { S.forecast = f; S.dirty = true; }
+  } catch (e) { /* keep the last curve */ }
+  finally { loadForecast.t = setTimeout(loadForecast, 30000); }
+}
 
 async function getJSON(path) {
   const r = await fetch(path, { cache: "no-store" });
@@ -126,7 +210,7 @@ function connectFeed(exchange) {
             S.live[c] = { last: +k.last, chg: k.change_pct / 100, at: Date.now() };
             if (c === S.coin) setStats({ bid: k.bid, ask: k.ask, high24: k.high, low24: k.low, chg: k.change_pct / 100 });
           }
-          paintMarkets();
+          paintTape();
         }
       };
       ws.onclose = retry(ws);
@@ -146,7 +230,7 @@ function connectFeed(exchange) {
           onPrice(+k.price, Date.now() / 1000, true);
           setStats({ bid: +k.best_bid, ask: +k.best_ask, high24: +k.high_24_h, low24: +k.low_24_h, chg: +k.price_percent_chg_24_h / 100 });
         }
-        paintMarkets();
+        paintTape();
       };
       ws.onclose = retry(ws);
       S.ws = ws;
@@ -235,11 +319,8 @@ function draw(now) {
   // projection inputs
   const st = S.status, pol = st && st.policy, sig = st && st.state.signal;
   const p0 = S.last ?? (bars && bars.length ? bars[bars.length - 1][4] : pts && pts.length ? pts[pts.length - 1][1] : null);
-  let cone = null;
-  if (sig && p0) {
-    const drift = pol.model === "momentum" ? 0 : sig.pred;
-    cone = { drift, sigma: sig.sigma_h, H: sig.horizon || pol.horizon };
-  }
+  const fc = S.forecast && S.forecast.coin === S.coin ? S.forecast : null;
+  const cone = fc && p0 ? { fc } : null;
 
   // y range
   let lo = Infinity, hi = -Infinity;
@@ -248,9 +329,9 @@ function draw(now) {
   if (p0) { lo = Math.min(lo, p0); hi = Math.max(hi, p0); }
   if (!isFinite(lo)) return;
   const span0 = Math.max(hi - lo, p0 * 0.002);
-  if (cone) { // let the 1-sigma band show without flattening the history
-    const fv = Math.min(1, (meta.span * 0.25) / (cone.H * 3600));
-    const up = p0 * Math.exp(cone.drift * fv + cone.sigma * Math.sqrt(fv)), dn = p0 * Math.exp(cone.drift * fv - cone.sigma * Math.sqrt(fv));
+  if (cone) { // let the 80% band show without flattening the history
+    const v = fcAt(cone.fc, (meta.span * 0.25) / 60);
+    const up = p0 * Math.exp(v.q90), dn = p0 * Math.exp(v.q10);
     hi = Math.min(Math.max(hi, up), hi + span0 * 1.2); lo = Math.max(Math.min(lo, dn), lo - span0 * 1.2);
   }
   const pos = st && st.state.position;
@@ -297,20 +378,18 @@ function draw(now) {
   ctx.beginPath(); ctx.moveTo(xNow + 0.5, padT); ctx.lineTo(xNow + 0.5, H - padB); ctx.stroke();
   ctx.setLineDash([]);
 
-  // projection cone
+  // forecast: median path with 50% and 80% bands, as far ahead as the strip covers at this view's scale
   if (cone) {
-    // the strip shows as much future as its width covers at this view's time scale (capped at H)
     const secsPerPx = (t1 - t0) / (xNow - padL);
-    const fMax = Math.min(1, (futureW - 6) * secsPerPx / (cone.H * 3600));
-    cone.fMax = fMax;
-    cone.fToX = (f) => xNow + (f * cone.H * 3600) / secsPerPx; // same time scale as the history
-    const N = 40, xs = [], b2u = [], b2d = [], b1u = [], b1d = [], mid = [];
+    const aheadMax = Math.max(60, (futureW - 6) * secsPerPx);
+    cone.secsPerPx = secsPerPx; cone.aheadMax = aheadMax;
+    const N = 48, xs = [], b2u = [], b2d = [], b1u = [], b1d = [], mid = [];
     for (let k = 0; k <= N; k++) {
-      const f = (k / N) * fMax, s = cone.sigma * Math.sqrt(f), m = cone.drift * f;
-      xs.push(cone.fToX(f));
-      mid.push(Y(p0 * Math.exp(m)));
-      b1u.push(Y(p0 * Math.exp(m + s))); b1d.push(Y(p0 * Math.exp(m - s)));
-      b2u.push(Y(p0 * Math.exp(m + 2 * s))); b2d.push(Y(p0 * Math.exp(m - 2 * s)));
+      const sec = (k / N) * aheadMax, v = fcAt(cone.fc, sec / 60);
+      xs.push(xNow + sec / secsPerPx);
+      mid.push(Y(p0 * Math.exp(v.q50)));
+      b1u.push(Y(p0 * Math.exp(v.q75))); b1d.push(Y(p0 * Math.exp(v.q25)));
+      b2u.push(Y(p0 * Math.exp(v.q90))); b2d.push(Y(p0 * Math.exp(v.q10)));
     }
     ctx.save();
     ctx.beginPath(); ctx.rect(xNow, padT, futureW, H - padT - padB); ctx.clip();
@@ -320,17 +399,15 @@ function draw(now) {
       for (let k = N; k >= 0; k--) ctx.lineTo(xs[k], d[k]);
       ctx.closePath(); ctx.fillStyle = `rgba(95,227,232,${a})`; ctx.fill();
     };
-    band(b2u, b2d, 0.07); band(b1u, b1d, 0.13);
-    ctx.shadowColor = C.cyan; ctx.shadowBlur = 8; ctx.strokeStyle = C.cyan; ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]);
+    band(b2u, b2d, 0.08); band(b1u, b1d, 0.16);
+    ctx.shadowColor = C.cyan; ctx.shadowBlur = 8; ctx.strokeStyle = C.cyan; ctx.lineWidth = 1.6; ctx.setLineDash([5, 4]);
     ctx.beginPath(); ctx.moveTo(xs[0], mid[0]); for (let k = 1; k <= N; k++) ctx.lineTo(xs[k], mid[k]); ctx.stroke();
     ctx.restore();
+    const end = fcAt(cone.fc, aheadMax / 60);
     ctx.fillStyle = C.cyan; ctx.font = "17px VT323";
-    const ahead = fMax * cone.H;
-    const label = pol.model === "momentum" ? (sig.pred > 0 ? "trend up, long" : "trend down, cash")
-      : `${pct(cone.drift)} in ${cone.H}h`;
-    ctx.fillText(label, xNow + 6, padT + 14);
+    ctx.fillText(`${fmtAhead(aheadMax)}: ${pct(Math.exp(end.q50) - 1, 2)}`, xNow + 6, padT + 14);
     ctx.fillStyle = "rgba(95,227,232,0.6)";
-    ctx.fillText(`next ${ahead < 1 ? Math.round(ahead * 60) + "m" : ahead.toFixed(ahead < 10 ? 1 : 0) + "h"} shown`, xNow + 6, padT + 30);
+    ctx.fillText(`80%: ${pct(Math.exp(end.q10) - 1, 1)} to ${pct(Math.exp(end.q90) - 1, 1)}`, xNow + 6, padT + 30);
   }
 
   // history
@@ -407,10 +484,10 @@ function draw(now) {
     ctx.setLineDash([]);
     const price = lo + (1 - (y - padT) / (H - padT - padB)) * (hi - lo);
     let text;
-    if (x > xNow && cone) {
-      const secsPerPx = (t1 - t0) / (xNow - padL);
-      const f = Math.min(cone.fMax || 1, ((x - xNow) * secsPerPx) / (cone.H * 3600)), hrs = f * cone.H;
-      text = `in ${hrs.toFixed(1)}h (model)\nmedian ${pxr(p0 * Math.exp(cone.drift * f))}\n1σ ${pxr(p0 * Math.exp(cone.drift * f - cone.sigma * Math.sqrt(f)))} – ${pxr(p0 * Math.exp(cone.drift * f + cone.sigma * Math.sqrt(f)))}`;
+    if (x > xNow && cone && cone.secsPerPx) {
+      const sec = Math.min(cone.aheadMax, (x - xNow) * cone.secsPerPx), v = fcAt(cone.fc, sec / 60);
+      const P = (q) => pxr(p0 * Math.exp(v[q]));
+      text = `in ${fmtAhead(sec)} (forecast)\nmedian ${P("q50")}\n50%  ${P("q25")} – ${P("q75")}\n80%  ${P("q10")} – ${P("q90")}`;
     } else {
       const t = t0 + ((x - padL) / (xNow - padL)) * (t1 - t0);
       text = `${S.view === "1w" ? dayhh(t) : hhmm(t)}   ${px(price)}`;
@@ -449,11 +526,10 @@ async function pollStatus() {
     S.coins = Object.keys(st.coins || { BTC: {} });
     if (first) {
       if (!S.coins.includes(S.coin)) { S.coin = S.coins[0]; }
-      $("venue").textContent = `${st.exchange === "kraken" ? "kraken pro" : "coinbase advanced"}, ${st.mode} money`;
       connectFeed(st.exchange);
       if (st.coin !== S.coin) { setTimeout(pollStatus, 0); }
     }
-    paintCoins();
+    paintTape();
     if (S.bootId && st.boot_id !== S.bootId) {
       log("the bot restarted. reload this page to reconnect your session.", "err");
       S.since = 0;
@@ -486,41 +562,41 @@ function paintPanels() {
   bot.textContent = st.busy ? st.busy : s.halted ? "halted" : s.auto === false ? "bot off" : "bot on";
   bot.classList.toggle("on", s.auto !== false && !s.halted);
   bot.classList.toggle("busy", !!st.busy);
-  const mode = $("lamp-mode");
-  mode.textContent = st.mode === "live" ? "live money" : "paper";
-  mode.classList.toggle("live", st.mode === "live");
+  $("lamp-mode").hidden = st.mode === "live";  // only paper trading gets a label
   // account
   const pv = st.portfolio;
   if (pv) {  // headline: everything the bot manages, P&L against what was actually put in
-    $("equity").textContent = usd(pv.equity);
+    tween($("equity"), pv.equity, usd);
     const el = $("pnl");
     el.textContent = `${pv.pnl >= 0 ? "+" : "−"}$${num(Math.abs(pv.pnl), 2)} (${pct(pv.basis ? pv.pnl / pv.basis : 0, 1)})`;
     el.classList.toggle("neg", pv.pnl < 0);
-    paintMarkets();
-    $("breakdown").textContent = Object.entries(pv.parts).filter(([, v]) => v >= 0.01)
-      .map(([k, v]) => `${k === "BETS" ? "bets" : k.toLowerCase()} ${usd(v)}`).join("   ") + `   fees so far ${usd(pv.fees)}`;
+    $("pnl-note").textContent = `of ${usd(pv.basis)} in`;
+    $("pnl-note").title = `${usd(pv.basis)} deposited, net of withdrawals; ${usd(pv.fees)} paid in fees so far`;
+    paintAlloc(pv);
   }
+  $("sleeve-label").textContent = `${COIN_META[S.coin].name} sleeve`;
   if (last) {
-    const eq = L.usd + L.qty * last;
-    $("sleeve-label").textContent = `${S.coin.toLowerCase()} trend sleeve`;
-    $("sleeve-eq").textContent = usd(eq);
-    $("btc").textContent = `${+(+(L.qty || 0)).toPrecision(6)} ≈ ${usd(L.qty * last)}`;
-    $("qty-label").textContent = COIN_META[S.coin].name;
+    $("btc").textContent = L.qty > 0 ? `${+(+L.qty).toPrecision(6)} ${S.coin.toLowerCase()} · ${usd(L.qty * last)}` : "none";
   }
   $("cash").textContent = usd(L.usd);
   $("fees").textContent = usd(L.fees);
   const pos = s.position;
-  $("pos").textContent = pos ? `${pos.manual ? "manual" : "long " + Math.round((pos.frac || 1) * 100) + "%"} from ${pxr(pos.entry_px)}` : "flat";
+  const since = pos && last ? ` (${pct(last / pos.entry_px - 1, 1)})` : "";
+  $("pos").textContent = pos ? `${pos.manual ? "manual" : "long " + Math.round((pos.frac || 1) * 100) + "%"} from ${pxr(pos.entry_px)}${since}` : "flat";
+  $("pos").className = pos && last ? (last < pos.entry_px ? "neg" : "pos") : "";
   $("stop").textContent = pos && pos.stop_px > pos.entry_px * 0.01 ? pxr(pos.stop_px) : "—";
   // model
   $("model-name").textContent = pol.model === "momentum" ? `${pol.sma_days}-day trend rule` : `${pol.model}, ${pol.horizon}h horizon`;
   $("cost").textContent = pct(pol.round_trip, 2).replace("+", "");
-  $("gate").textContent = pol.model === "momentum" ? "ml failed, rule in charge"
-    : pol.gate_pass ? "passed" : st.mode === "live" ? "failed: watching only" : "failed: paper only";
+  $("gate").textContent = pol.model === "momentum" ? `${pol.sma_days}-day trend rule`
+    : pol.gate_pass ? "ML model" : st.mode === "live" ? "ML, watching only" : "ML, paper only";
+  $("ml").textContent = pol.model === "momentum" || !pol.gate_pass ? "lost to fees in testing" : "beat fees in testing";
   paintGauge(pol, sig);
   const next = (Math.floor(Date.now() / 3600000) + 1) * 3600000 + 20000;
   const left = Math.max(0, next - Date.now());
   $("countdown").textContent = `in ${Math.floor(left / 60000)}m ${String(Math.floor((left % 60000) / 1000)).padStart(2, "0")}s`;
+  paintBets();
+  paintCalls();
   $("hint").textContent = S.pending ? `confirm ${S.pending}: ${st.pending_desc || "pending action"}` : st.busy ? `bot is ${st.busy}` : "↑ ↓ history";
 }
 
@@ -566,7 +642,11 @@ function onEvent(e) {
     case "halted": case "KILL_SWITCH": log(e.note || "kill switch fired: flattened and halted", "err", t); break;
     case "skip": log(e.note, "model", t); break;
     case "deposit": case "withdraw": case "auto": case "resume": case "move":
-    case "pool_fund": case "pool_defund": case "pool_auto": case "pool_resume": break; // the command reply already said it
+    case "pool_fund": case "pool_defund": case "pool_auto": case "pool_resume": case "pool_autofund": break;
+    case "sell_for_bet":
+      log(`sold ${+(+f.size).toPrecision(6)} ${(e.coin || "btc").toLowerCase()} at ${px(f.price)} (fee ${usd(f.fee)}) to fund a ${e.bet.toLowerCase()} bet`, "ok", t);
+      S.allFills.push({ t, price: f.price, size: f.size, side: "sell", kind: e.event, coin: e.coin || "BTC" });
+      paintFills(); S.dirty = true; break; // the command reply already said it
     case "bet_open": {
       log(`bet ${e.coin.toLowerCase()}: ${e.side} ${+(+e.fill.size).toPrecision(6)} at ${px(e.fill.price)} for ${e.H}h (P(up) ${Math.round(e.p_up * 100)}%)`, "model", t);
       S.allFills.push({ t, price: e.fill.price, size: e.fill.size, side: e.side === "long" ? "buy" : "sell", kind: "bet", coin: e.coin });
@@ -594,95 +674,245 @@ function onEvent(e) {
   }
 }
 
+function cycleCoin(step) {
+  const i = S.coins.indexOf(S.coin);
+  if (i >= 0 && S.coins.length > 1) switchCoin(S.coins[(i + step + S.coins.length) % S.coins.length]);
+}
+
 function switchCoin(c) {
   if (c === S.coin) return;
   S.coin = c;
   try { localStorage.setItem("btcbot.coin", c); } catch (e) { /* private mode */ }
   S.ticks = []; S.last = null; S.prevLast = null; S.data = null; S.wsTickAt = 0; S.dirty = true;
   $("price").textContent = "—";
-  paintCoins(); paintFills();
+  $("pair").textContent = `${c.toLowerCase()}/usd`;
+  $("coin-name").textContent = COIN_META[c].name;
+  if (!reduced) { const cv = $("chart"); cv.classList.remove("swap"); void cv.offsetWidth; cv.classList.add("swap"); }
+  paintTape(); paintFills();
   pollStatus();
-  log(`showing ${COIN_META[c].name}`, "ok");
   loadView(S.view);
+  S.forecast = null; loadForecast();
   pollNotes.key = null; pollNotes();
   if (S.status) connectFeed(S.status.exchange);
 }
 
-function paintCoins() {
+// coin tape: every coin's live price, 24h move and what you hold of it, always on screen
+function paintTape() {
+  const nav = $("tape");
   $("pair").textContent = `${S.coin.toLowerCase()}/usd`;
-  const nav = $("coins");
-  const coins = (S.status && S.status.coins) || {};
-  nav.textContent = "";
-  S.coins.forEach((c) => {
-    const info = coins[c] || {};
-    const L = info.ledger || {};
-    const b = document.createElement("button");
-    b.dataset.coin = c;
-    b.setAttribute("role", "tab");
+  $("coin-name").textContent = COIN_META[S.coin].name;
+  const pv = S.status && S.status.portfolio;
+  const coins = S.coins.length ? S.coins : Object.keys(COIN_META);
+  if (nav.querySelectorAll("button").length !== coins.length) {  // build once; then only update text
+    nav.querySelectorAll("button").forEach((b) => b.remove());
+    for (const c of coins) {
+      const b = document.createElement("button");
+      b.dataset.coin = c;
+      b.setAttribute("role", "tab");
+      b.title = `Show ${COIN_META[c].name}`;
+      b.innerHTML = '<span class="t-sym"></span><span class="t-name"></span><span class="t-px"></span>' +
+        '<span class="t-chg"></span><span class="t-held"></span><span class="t-tags"></span><span class="t-call"></span>';
+      b.querySelector(".t-sym").textContent = c.toLowerCase();
+      b.querySelector(".t-name").textContent = COIN_META[c].name;
+      nav.append(b);
+    }
+  }
+  for (const b of nav.querySelectorAll("button")) {
+    const c = b.dataset.coin, row = (pv && pv.coins && pv.coins[c]) || {}, live = S.live[c] || {};
+    const fresh = live.at && Date.now() - live.at < 15000;
+    const last = fresh ? live.last : row.last, chg = fresh ? live.chg : row.chg24;
     b.setAttribute("aria-selected", String(c === S.coin));
-    b.title = `Show ${COIN_META[c].name}`;
-    const sym = document.createElement("span"); sym.className = "sym"; sym.textContent = c.toLowerCase();
-    const state = document.createElement("span"); state.className = "state";
-    const funded = (L.usd || 0) + (L.qty || 0) > 0;
-    state.textContent = info.halted ? "halted" : info.needs_review ? "review" : !funded ? "unfunded"
-      : info.position ? (info.position.manual ? "held" : "long") : info.auto === false ? "manual" : "cash";
-    if (info.position) b.classList.add("long");
-    b.append(sym, state);
-    nav.append(b);
-  });
-  const pool = S.status && S.status.pool;
-  if (pool) {  // the fenced short-term bet pool, shown beside the coins it bets on
-    const L = pool.ledger || {};
-    const tag = document.createElement("span");
-    tag.className = "pool-tag";
-    const open = Object.keys(pool.bets || {}).length;
-    const sym = document.createElement("span"); sym.className = "sym"; sym.textContent = "bets";
-    const st = document.createElement("span"); st.className = "state";
-    st.textContent = pool.halted ? "halted" : pool.needs_review ? "review" : (L.usd || 0) + open === 0 ? "unfunded"
-      : `${usd(L.usd)} cash, ${open} open`;
-    tag.title = "Short-term bet pool (its own cash; the trend sleeves never touch it). Type 'bets' for details.";
-    tag.append(sym, st);
-    nav.append(tag);
+    const pxEl = b.querySelector(".t-px"), prev = S.tapePx[c];
+    if (last != null && prev !== last) {
+      pxEl.textContent = px(last);
+      if (prev != null) flash(pxEl, last > prev);
+      S.tapePx[c] = last;
+    }
+    const ch = b.querySelector(".t-chg");
+    ch.textContent = chg == null ? "" : pct(chg, 2);
+    ch.classList.toggle("neg", chg < 0);
+    // what you hold of this coin (trend sleeve + any bet + sleeve cash), revalued at the live price
+    const value = row.qty != null ? (row.qty || 0) * (last || 0) + ((row.value || 0) - (row.qty || 0) * (row.last || 0)) : null;
+    const held = b.querySelector(".t-held");
+    if (value != null && value >= 0.005) tween(held, value, (v) => `held ${usd(v)}`, 450);
+    else { held.textContent = "held —"; held._v = null; }
+    held.classList.toggle("none", !(value >= 0.005));
+    const tags = [];
+    if (row.trend) tags.push(`<i class="${row.trend}">${row.trend === "up" ? "▲ trend up" : "▼ trend down"}</i>`);
+    if (row.bet) tags.push(`<i class="betting">● bet ${pct(row.bet.pnl_pct, 1)}</i>`);
+    const tg = b.querySelector(".t-tags"), html = tags.join("");
+    if (tg.innerHTML !== html) tg.innerHTML = html;
+    const call = ((S.status && S.status.calls) || {})[c], ce = b.querySelector(".t-call");
+    const odds = liveOdds(call, coinPrice(c)), left = call && call.until ? Date.parse(call.until) / 1000 - Date.now() / 1000 : 0;
+    ce.className = `t-call ${odds == null || left <= 0 ? "none" : odds >= 0.5 ? "up" : "down"}`;
+    const kc = kalshiCents(call);
+    ce.textContent = !call ? "" : call.error ? "15-minute odds unavailable" : odds == null ? "" : left <= 0 ? "15-minute window closed; next one starting"
+      : `By ${hhmm(Date.parse(call.until) / 1000)}: ${Math.round(odds * 100)}% chance it's higher${kc != null ? ` · Kalshi ${kc}%` : ""}`;
+    ce.title = call && call.start ? `Chance the price at ${hhmm(Date.parse(call.until) / 1000)} is above ${px(call.start)}, where this 15-minute window started` : "";
+  }
+  const sel = nav.querySelector('button[aria-selected="true"]'), glow = $("tape-glow");
+  if (sel) { glow.style.width = `${sel.offsetWidth}px`; glow.style.transform = `translateX(${sel.offsetLeft}px)`; glow.style.opacity = 1; }
+}
+
+// where the money is: one bar, one segment per sleeve and the bet pool
+function paintAlloc(pv) {
+  const parts = Object.entries(pv.parts).filter(([, v]) => v >= 0.01);
+  const total = parts.reduce((a, [, v]) => a + v, 0) || 1;
+  const bar = $("alloc"), leg = $("alloc-legend");
+  const key = parts.map(([k]) => k).join();
+  if (bar.dataset.key !== key) {
+    bar.dataset.key = key; bar.textContent = ""; leg.textContent = "";
+    for (const [k] of parts) {
+      const seg = document.createElement("span"); seg.dataset.k = k; seg.style.background = ALLOC[k] || "#3a5562"; seg.style.width = "0%";
+      bar.append(seg);
+      const li = document.createElement("li"); li.dataset.k = k;
+      li.innerHTML = '<i></i><span class="k"></span><span class="v"></span><span class="p"></span>';
+      li.querySelector("i").style.background = ALLOC[k] || "#3a5562";  // CSSOM, not a style attribute (CSP)
+      li.querySelector(".k").textContent = k === "BETS" ? "bets" : k.toLowerCase();
+      if (k !== "BETS") { li.classList.add("link"); li.title = `Show ${COIN_META[k].name}`; li.addEventListener("click", () => switchCoin(k)); }
+      leg.append(li);
+    }
+  }
+  for (const [k, v] of parts) {
+    bar.querySelector(`[data-k="${k}"]`).style.width = `${(v / total) * 100}%`;
+    const li = leg.querySelector(`[data-k="${k}"]`);
+    li.querySelector(".v").textContent = usd(v);
+    li.querySelector(".p").textContent = `${Math.round((v / total) * 100)}%`;
+    li.classList.toggle("sel", k === S.coin);
   }
 }
 
-function paintMarkets() {
-  const body = $("markets");
-  const pv = S.status && S.status.portfolio;
-  if (!body || !pv || !pv.coins) return;
-  const coins = S.coins.length ? S.coins : Object.keys(pv.coins);
-  if (body.childElementCount !== coins.length) {  // build rows once; then only update cell text
-    body.textContent = "";
-    for (const c of coins) {
-      const tr = document.createElement("tr");
-      tr.dataset.coin = c;
-      tr.innerHTML = '<td><span class="sym"></span><span class="tag"></span></td><td class="px"></td><td class="d24"></td><td><span class="val"></span><span class="tag qty"></span></td>';
-      tr.addEventListener("click", () => switchCoin(c));
-      body.append(tr);
+// could a bet on `c` raise its stake? idle sleeve cash, or another coin worth selling (never c itself)
+function canFund(c) {
+  const rows = (S.status && S.status.portfolio && S.status.portfolio.coins) || {};
+  return Object.entries(rows).some(([k, r]) => (r.value || 0) - (r.qty || 0) * (r.last || 0) >= 6
+    || (k !== c && (r.qty_trend || 0) * (r.last || 0) >= 6));
+}
+
+// the short-term bet pool: one card per open bet, and how close each other coin is to a bet
+// 15-minute up/down calls: recommendations with their tested and live record (the bot never trades them)
+function paintCalls() {
+  const calls = S.status && S.status.calls, win = $("calls-win");
+  win.hidden = !calls || !Object.keys(calls).length;
+  if (win.hidden) return;
+  const ol = $("calls");
+  const next = (Math.floor(Date.now() / 900000) + 1) * 900000 + 30000;
+  const any = Object.values(calls).find((k) => k.until);
+  $("calls-sub").textContent = any ? `${hhmm(Date.parse(any.from) / 1000)}–${hhmm(Date.parse(any.until) / 1000)} · ${mmss(Date.parse(any.until) / 1000 - Date.now() / 1000)} left`
+    : `next in ${dur((next - Date.now()) / 1000)}`;
+  let n = 0, hits = 0, net = 0, tested = [];
+  for (const c of S.coins) {
+    const k = calls[c]; if (!k) continue;
+    let li = ol.querySelector(`[data-c="${c}"]`);
+    if (!li) {
+      li = document.createElement("li"); li.dataset.c = c;
+      li.innerHTML = '<b></b><span class="say"></span><span class="sub"></span>';
+      li.querySelector("b").textContent = c.toLowerCase();
+      li.addEventListener("click", () => switchCoin(c));
+      ol.append(li);
     }
-  }
-  for (const tr of body.children) {
-    const c = tr.dataset.coin, row = pv.coins[c] || {}, live = S.live[c] || {};
-    const last = live.at && Date.now() - live.at < 15000 ? live.last : row.last;
-    const chg = live.at && Date.now() - live.at < 15000 ? live.chg : row.chg24;
-    tr.classList.toggle("sel", c === S.coin);
-    tr.querySelector(".sym").textContent = c.toLowerCase();
-    const tag = tr.querySelector(".tag");
-    const bet = row.bet ? ` · bet ${pct(row.bet.pnl_pct, 1)}` : "";
-    tag.textContent = (row.trend === "up" ? "↑ up" : row.trend === "down" ? "↓ down" : "—") + bet;
-    tag.className = `tag ${row.trend === "up" ? "up" : ""}`;
-    const pxCell = tr.querySelector(".px"), txt = px(last);
-    if (pxCell.textContent !== txt) {
-      if (pxCell.textContent && !reduced) { pxCell.classList.remove("flash"); void pxCell.offsetWidth; pxCell.classList.add("flash"); }
-      pxCell.textContent = txt;
+    if (li.dataset.bar !== k.bar && li.dataset.bar && !reduced) { li.classList.remove("fresh"); void li.offsetWidth; li.classList.add("fresh"); }
+    li.dataset.bar = k.bar || "";
+    const price = coinPrice(c), odds = liveOdds(k, price), say = li.querySelector(".say");
+    li.className = `${li.classList.contains("fresh") ? "fresh " : ""}${odds == null ? "none" : odds >= 0.6 ? "up" : odds <= 0.4 ? "down" : "even"}`;
+    if (k.error || odds == null) {
+      say.textContent = k.error ? "odds unavailable right now" : "waiting for the window to start";
+      li.querySelector(".sub").textContent = "";
+    } else {
+      const pctTxt = `${Math.round(odds * 100)}%`;
+      if (li._odds != null && Math.round(li._odds * 100) !== Math.round(odds * 100)) flash(say, odds > li._odds);
+      li._odds = odds;
+      say.textContent = `${verdict(odds)[0].toUpperCase() + verdict(odds).slice(1)}: ${pctTxt} chance it ends above ${px(k.start)}`;
+      const diff = price - k.start, kc = kalshiCents(k);
+      const parts = [`now ${px(price)}, ${diff >= 0 ? "$" + num(Math.abs(diff), pdec(price)) + " above" : "$" + num(Math.abs(diff), pdec(price)) + " below"}`];
+      if (kc != null) parts.push(`Kalshi says ${kc}%`);
+      if (k.dir) parts.push(`model called ${k.dir === "up" ? "higher" : "lower"} at the start`);
+      li.querySelector(".sub").textContent = parts.join(" · ");
     }
-    const chgCell = tr.querySelector(".d24");
-    chgCell.textContent = pct(chg, 2);
-    chgCell.className = `d24 ${chg < 0 ? "neg" : "up"}`;
-    const value = (row.qty || 0) * (last || 0) + ((row.value || 0) - (row.qty || 0) * (row.last || 0));
-    tr.querySelector(".val").textContent = row.qty > 0 ? usd(value) : "—";
-    tr.querySelector(".qty").textContent = row.qty > 0 ? `${+(+row.qty).toPrecision(4)}` : "none";
+    li.title = `Show ${COIN_META[c].name}`;
+    const r = k.record || {};
+    n += r.n || 0; hits += r.hits || 0; net += r.net_bp || 0;
+    if (k.tested && k.tested.hit_rate != null) tested.push(k.tested);
   }
+  const avg = (key) => tested.reduce((a, x) => a + x[key], 0) / (tested.length || 1);
+  $("calls-note").textContent = "Each line is the chance a coin finishes this 15-minute window higher than it started, "
+    + "judged on the average price in the last minute, the way Kalshi settles. It updates as the price moves. "
+    + (n ? `The model's opening calls were right ${hits} of ${n} time${n === 1 ? "" : "s"} in the last day. ` : "")
+    + (tested.length ? `In testing they were right ${Math.round(avg("hit_rate") * 100)}% of the time but still lost money once trading fees were paid. ` : "")
+    + "For information only; the bot never trades on these.";
+}
+
+function paintBets() {
+  const st = S.status, pool = st && st.pool, box = $("bets"), head = $("bets-head");
+  const win = box.closest(".bets-win");
+  win.hidden = !pool;
+  if (!pool) return;
+  const L = pool.ledger || {}, bets = pool.bets || {}, open = Object.keys(bets);
+  const eq = st.portfolio && st.portfolio.parts ? st.portfolio.parts.BETS : null;
+  const state = pool.halted ? "halted" : pool.needs_review ? "needs review" : pool.auto === false ? "paused" : "betting";
+  $("bets-sub").textContent = `${state}${pool.shorts ? ", long + short" : ", long only"}${pool.autofund !== false ? ", sells coins to fund" : ""}`;
+  win.classList.toggle("alert", state === "halted" || state === "needs review");
+  head.innerHTML = "";
+  for (const [k, v, cls] of [["pool", usd(eq), ""], ["free cash", usd(L.usd), ""], ["open", String(open.length), ""],
+    ["realized", `${(L.realized || 0) >= 0 ? "+" : "−"}$${num(Math.abs(L.realized || 0), 2)}`, (L.realized || 0) < 0 ? "neg" : ""]]) {
+    const d = document.createElement("div");
+    d.innerHTML = `<span class="k"></span><span class="v ${cls}"></span>`;
+    d.querySelector(".k").textContent = k; d.querySelector(".v").textContent = v;
+    head.append(d);
+  }
+  const now = Date.now() / 1000;
+  const want = new Set();
+  for (const c of open) {
+    want.add(`bet-${c}`);
+    const b = bets[c], last = (S.live[c] && S.live[c].last) || ((st.portfolio && st.portfolio.coins && st.portfolio.coins[c]) || {}).last || b.entry_px;
+    const side = b.side > 0 ? 1 : -1, ret = (last / b.entry_px - 1) * side, pnl = b.qty * (last - b.entry_px) * side;
+    const t0 = Date.parse(b.bar_close || b.opened) / 1000, t1 = t0 + b.H * 3600;
+    const done = Math.min(1, Math.max(0, (now - t0) / (t1 - t0)));
+    const toStop = side > 0 ? b.stop_px / last - 1 : last / b.stop_px - 1;
+    let card = box.querySelector(`[data-id="bet-${c}"]`);
+    if (!card) {
+      card = document.createElement("article");
+      card.className = "bet" + (reduced ? "" : " new"); card.dataset.id = `bet-${c}`;
+      card.innerHTML = '<header><b class="c"></b><span class="side"></span><span class="ret"></span><span class="pnl"></span></header>' +
+        '<div class="time"><span class="fill"></span></div><footer><span class="left"></span><span class="stop"></span></footer>';
+      card.addEventListener("click", () => switchCoin(c));
+      card.title = `Show ${COIN_META[c].name}`;
+      box.prepend(card);
+    }
+    card.querySelector(".c").textContent = c.toLowerCase();
+    card.querySelector(".side").textContent = `${side > 0 ? "long" : "short"} ${usd(b.stake)} · ${Math.round(b.p_up * 100)}% up`;
+    const r = card.querySelector(".ret"); r.textContent = pct(ret, 2); r.classList.toggle("neg", ret < 0);
+    const pl = card.querySelector(".pnl"); pl.textContent = `${pnl >= 0 ? "+" : "−"}$${num(Math.abs(pnl), 2)}`; pl.classList.toggle("neg", pnl < 0);
+    card.classList.toggle("losing", ret < 0);
+    card.querySelector(".fill").style.width = `${done * 100}%`;
+    card.querySelector(".left").textContent = `${pxr(b.entry_px)} → ${pxr(last)} · ${dur(t1 - now)} left`;
+    card.querySelector(".stop").textContent = `stop ${pxr(b.stop_px)} ${pct(toStop, 1)}`;
+    card.querySelector(".time").title = `closes around ${dayhh(t1)}`;
+  }
+  const sigs = pool.signals || {}, models = pool.models || {};
+  for (const c of S.coins) {
+    if (bets[c] || !models[c]) continue;
+    want.add(`watch-${c}`);
+    const sg = sigs[c], thr = models[c].threshold;
+    let row = box.querySelector(`[data-id="watch-${c}"]`);
+    if (!row) {
+      row = document.createElement("div"); row.className = "watch"; row.dataset.id = `watch-${c}`;
+      row.innerHTML = '<b class="c"></b><span class="meter"><span class="lvl"></span><span class="thr"></span></span><span class="txt"></span>';
+      row.querySelector(".c").textContent = c.toLowerCase();
+      box.append(row);
+    }
+    const p = sg ? sg.p_up : null;
+    row.querySelector(".lvl").style.width = p == null ? "0%" : `${Math.min(100, Math.max(0, (p - 0.3) / 0.5 * 100))}%`;
+    row.querySelector(".thr").style.left = `${Math.min(100, Math.max(0, (thr - 0.3) / 0.5 * 100))}%`;
+    row.classList.toggle("ready", p != null && p >= thr);
+    const broke = p != null && p >= thr && (L.usd || 0) < 1;  // the model wants a bet the pool can't pay for
+    row.querySelector(".txt").textContent = p == null ? `waiting for the hour · bets at ${Math.round(thr * 100)}%`
+      : broke ? `${Math.round(p * 100)}% up · ${pool.autofund === false ? "no free cash" : canFund(c) ? "raises stake next hour" : `nothing but ${c.toLowerCase()} to sell`}` : `${Math.round(p * 100)}% up · bets at ${Math.round(thr * 100)}%`;
+    row.classList.toggle("broke", broke);
+    row.title = `${COIN_META[c].name}: the bet model's chance the price is higher in ${models[c].H}h`;
+  }
+  for (const el of [...box.children]) if (!want.has(el.dataset.id)) el.remove();
+  if (!box.children.length) box.innerHTML = '<p class="empty">no bets open</p>';
 }
 
 function paintFills() {
@@ -772,6 +1002,9 @@ function wire() {
   document.querySelectorAll(".keys button").forEach((b) => b.addEventListener("click", () => loadView(b.dataset.view)));
   $("prompt").addEventListener("submit", (ev) => { ev.preventDefault(); const i = $("cmd"); submit(i.value); i.value = ""; });
   $("cmd").addEventListener("keydown", (ev) => {
+    if ((ev.key === "ArrowLeft" || ev.key === "ArrowRight") && !$("cmd").value) {  // empty prompt: step through coins
+      ev.preventDefault(); cycleCoin(ev.key === "ArrowLeft" ? -1 : 1); return;
+    }
     if (ev.key !== "ArrowUp" && ev.key !== "ArrowDown") return;
     ev.preventDefault();
     if (!S.history.length) return;
@@ -781,21 +1014,25 @@ function wire() {
   });
   document.addEventListener("keydown", (ev) => {
     if (ev.target.tagName === "INPUT") return;
+    if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") { ev.preventDefault(); cycleCoin(ev.key === "ArrowLeft" ? -1 : 1); return; }
     if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey) $("cmd").focus();
   });
-  $("coins").addEventListener("click", (ev) => { const b = ev.target.closest("button[data-coin]"); if (b) switchCoin(b.dataset.coin); });
+  $("tape").addEventListener("click", (ev) => { const b = ev.target.closest("button[data-coin]"); if (b) switchCoin(b.dataset.coin); });
+  window.addEventListener("resize", () => paintTape());
   const cv = $("chart");
   cv.addEventListener("pointermove", (ev) => { const r = cv.getBoundingClientRect(); S.hover = { x: ev.clientX - r.left, y: ev.clientY - r.top }; S.dirty = true; });
   cv.addEventListener("pointerleave", () => { S.hover = null; S.dirty = true; });
   window.addEventListener("resize", () => { S.dirty = true; });
   setInterval(paintPanels, 1000);
+  setInterval(paintTape, 1000);  // the 15-minute countdown and odds keep moving between price ticks
 }
 
 loadHistory();
 wire();
 boot();
-log("type help for commands, or click a chart range or a coin.", "model");
+log("type help for commands, or click a chart range or a coin. ← → step through the coins.", "model");
 loadView("1h");
+loadForecast();
 pollStatus();
 pollNotes();
 requestAnimationFrame(frame);

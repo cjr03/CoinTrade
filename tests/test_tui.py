@@ -87,17 +87,62 @@ def test_chart_ranges_coins_and_commands_are_clickable(monkeypatch):
         desk = tui.Desk()
         async with desk.run_test(size=(140, 40)) as pilot:
             desk.coins_cache = ["BTC", "ETH", "SOL", "XRP"]
-            desk.paint_coins()
+            desk.paint_tape()
             await pilot.pause()
             keys = desk.query_one("#keys")
             await pilot.click("#keys", offset=where(keys, " 1d "))
             await pilot.pause()
             assert desk.view == "1d"
-            await pilot.click("#coins", offset=where(desk.query_one("#coins"), " sol "))
+            await pilot.click("#tape-SOL")
             await pilot.pause()
             assert desk.coin == "SOL"
+            await pilot.press("right"); await pilot.pause()
+            assert desk.coin == "XRP"
+            await pilot.press("right"); await pilot.pause()
+            assert desk.coin == "BTC"  # wraps around
+            await pilot.press("left"); await pilot.pause()
+            assert desk.coin == "XRP"
             await pilot.click("#actions", offset=where(desk.query_one("#actions"), " sell "))
             await pilot.pause()
             assert desk.query_one("#prompt").value == "sell " and desk.history == []  # filled, not sent
+
+    asyncio.run(go())
+
+
+def test_bets_panel_tape_and_portfolio_render(monkeypatch):
+    """The bet pool, the coin tape and the portfolio paint from a realistic status without a bot."""
+    import asyncio
+    import btcbot.tui as tui
+
+    monkeypatch.setattr(tui, "BASE", "http://127.0.0.1:9")
+    bet = {"side": 1, "qty": 0.003, "entry_px": 2431.77, "stake": 7.4, "opened": "2026-10-20T20:01:33+00:00",
+           "bar_close": "2026-10-20 20:00:00+00:00", "H": 24, "stop_px": 2306.9, "p_up": 0.61}
+    row = {"last": 2450.0, "chg24": 0.02, "qty": 0.003, "value": 7.35, "trend": "down",
+           "bet": {"side": "long", "entry": 2431.77, "pnl_pct": 0.0075}}
+    status = {"coin": "BTC", "mode": "live", "policy": {"model": "momentum", "sma_days": 50, "round_trip": 0.008},
+              "state": {"ledger": {"usd": 0.1, "qty": 0.001, "fees": 0.5}, "position": {"entry_px": 82659, "stop_px": 0}},
+              "coins": {c: {"ledger": {}} for c in ("BTC", "ETH", "SOL", "XRP")},
+              "pool": {"ledger": {"usd": 0.01, "realized": -0.12}, "bets": {"ETH": bet}, "auto": True,
+                       "signals": {"BTC": {"p_up": 0.62}}, "models": {c: {"H": 24, "threshold": 0.6} for c in ("BTC", "ETH", "SOL")}},
+              "portfolio": {"equity": 99.8, "basis": 100.0, "pnl": -0.2, "fees": 0.58,
+                            "parts": {"BTC": 84.9, "ETH": 0.0, "BETS": 14.9},
+                            "coins": {"BTC": {"last": 82900.0, "chg24": 0.01, "qty": 0.001, "value": 83.0, "trend": "up"},
+                                      "ETH": row, "SOL": {"last": 106.0, "chg24": 0.02, "qty": 0, "value": 0, "trend": "down"},
+                                      "XRP": {"last": 1.33, "chg24": 0.03, "qty": 0, "value": 0, "trend": "down"}}}}
+
+    async def go():
+        desk = tui.Desk()
+        async with desk.run_test(size=(150, 46)) as pilot:
+            desk.status, desk.pv, desk.last = status, status["portfolio"], 82900.0
+            desk.coin_states, desk.coins_cache = status["coins"], list(status["coins"])
+            desk.paint_panels(); desk.paint_tape(); desk.paint_lamps()
+            await pilot.pause()
+            bets = str(desk.query_one("#bets").render())
+            assert "eth long $7.40" in bets and "left" in bets and "stop" in bets and "bets at 60%" in bets
+            assert "−$0.12" in bets  # realized loss shown as a loss
+            assert "held $7.35" in str(desk.query_one("#tape-ETH").render())
+            assert "bets" in str(desk.query_one("#account").render())
+            lamps = str(desk.query_one("#lamps").render())
+            assert "live" not in lamps and "kraken" not in str(desk.query_one("#pair").render())
 
     asyncio.run(go())

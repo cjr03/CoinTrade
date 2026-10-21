@@ -15,6 +15,10 @@ artifacts/*
 !artifacts/policy*.json
 !artifacts/report_*.json
 !artifacts/coins_report.json
+# 15-minute call models and forecast bands: LightGBM text + JSON, safe to load (no pickles)
+!artifacts/calls_*.txt
+!artifacts/calls_*.json
+!artifacts/forecast_*.json
 # model pickles are rebuilt locally (python -m btcbot.train --final, python -m btcbot.bets --train);
 # never load a pickle you did not produce yourself
 *.pkl

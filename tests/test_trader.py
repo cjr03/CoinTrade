@@ -218,3 +218,82 @@ def test_bet_pool_books_balance(tmp_path, monkeypatch, side, exit_px):
     assert L["usd"] == pytest.approx(L["deposited"] - L["withdrawn"] + L["realized"])
     gross = side * 0.1 * (exit_px - 100.0)
     assert L["realized"] < gross  # fees (and margin on shorts) always cost something
+
+
+def _funding_portfolio(tmp_path, monkeypatch, btc_qty=0.8, btc_cash=0.0):
+    """Paper portfolio (BTC + ETH sleeves, bet pool) with fixed $100 prices and a sale stub instead of orders."""
+    monkeypatch.setattr(trader_mod, "STATE", tmp_path)
+    pf = trader_mod.Portfolio("paper", "kraken", "policy_momentum.json", ["BTC", "ETH"], bets=True)
+    sales = []
+    for t in pf.traders.values():
+        t.broker.quote = lambda: (100.0, 100.1)
+
+        def sell_maker(qty, deadline_s=0, ref_px=None, fallback_taker=True, t=t):
+            sales.append({"coin": t.coin, "qty": qty, "ref_px": ref_px, "deadline_s": deadline_s, "taker": fallback_taker})
+            return {"price": ref_px, "size": qty, "fee": qty * ref_px * 0.004, "liquidity": "maker"}
+        t.broker.sell_maker = sell_maker
+        t.broker.s["paper"]["usd"] = 1000.0  # paper cash moves need a simulated balance behind them
+    for b in pf.pool.brokers.values():
+        b.quote = lambda: (100.0, 100.1)
+    btc = pf.traders["BTC"]
+    btc.ledger.update(usd=btc_cash, qty=btc_qty, deposited=100.0)
+    btc.s["position"] = {"entry_time": "2026-10-20T00:00:00+00:00", "entry_px": 100.0, "qty": btc_qty, "frac": 1.0,
+                         "manual": False, "stop_px": 0.0}
+    return pf, sales
+
+
+def test_bet_sells_another_coin_for_its_stake(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch)
+    before = sum(t.equity(100.0) for t in pf.traders.values()) + pf.pool.equity({})
+    got = pf.fund_bet("ETH", 8.0)
+    assert len(sales) == 1 and sales[0]["coin"] == "BTC"
+    assert sales[0]["ref_px"] == 100.1 and sales[0]["deadline_s"] == 600 and sales[0]["taker"] is False  # maker only
+    assert 7.99 <= got <= 8.1 and pf.pool.ledger["usd"] == pytest.approx(got)
+    after = sum(t.equity(100.1) for t in pf.traders.values()) + pf.pool.equity({})
+    assert after == pytest.approx(before, abs=0.2)  # money moved, it wasn't created (only the small fee went)
+    btc = pf.traders["BTC"]
+    assert btc.s["position"]["qty"] == pytest.approx(btc.ledger["qty"])  # the trend position shrank with the sale
+    journal = (tmp_path / f"{btc.mode}_journal.jsonl").read_text()
+    assert '"sell_for_bet"' in journal and '"bet": "ETH"' in journal
+
+
+def test_bet_uses_idle_cash_before_selling(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch, btc_cash=20.0)
+    assert pf.fund_bet("ETH", 8.0) == pytest.approx(8.0, abs=0.01)
+    assert sales == [] and pf.traders["BTC"].ledger["usd"] == pytest.approx(12.0, abs=0.01)
+
+
+def test_bet_never_sells_the_coin_it_bets_on(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="only coin to sell is btc"):
+        pf.fund_bet("BTC", 8.0)
+    assert sales == [] and pf.pool.ledger["usd"] == 0
+
+
+def test_bet_funding_stops_at_the_lifetime_cap(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch)
+    pf.pool.ledger.update(deposited=20.0, usd=0.0)  # already given $20 of a ~$80 portfolio (cap 25% = ~$20)
+    with pytest.raises(ValueError, match="cap"):
+        pf.fund_bet("ETH", 8.0)
+    assert sales == []
+
+
+def test_open_asks_the_funder_only_when_allowed(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch)
+    pool, calls = pf.pool, []
+    pool.funder = lambda coin, want: calls.append((coin, want)) or 0.0
+    sig = {"close": 100.0, "bar": "2026-10-20 20:00:00+00:00", "H": 24, "p_up": 0.7, "sigma_h": 0.02}
+    pool.s["autofund"] = False
+    pool._open("ETH", 1, sig, 100.0, 100.1)
+    assert calls == []
+    pool.s["autofund"] = True
+    pool._open("ETH", 1, sig, 100.0, 100.1)
+    assert calls and calls[0][0] == "ETH" and calls[0][1] > 0
+
+
+def test_small_shortfall_still_sells_at_least_the_exchange_minimum(tmp_path, monkeypatch):
+    pf, sales = _funding_portfolio(tmp_path, monkeypatch)
+    pf.traders["BTC"].broker.min_order_usd = 5.5
+    pf.pool.ledger.update(usd=4.6, deposited=4.6)
+    pf.fund_bet("ETH", 1.0)  # the pool is $1 short, but Kraken won't take a $1 sale
+    assert sales and sales[0]["qty"] * sales[0]["ref_px"] >= 5.5 * 1.1

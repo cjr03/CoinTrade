@@ -5,7 +5,7 @@
 
 The TUI is a client of the bot's local server (127.0.0.1:BTCBOT_PORT), so it never runs a second
 trader against the same account.  Click a chart range, a coin, a market row or a command chip; up/down
-walk the command history, ctrl+l clears the console, ctrl+q quits.  Type `help` for commands.
+walk the command history, left/right (empty prompt) step through the coins, ctrl+l clears the console, ctrl+q quits.  Type `help` for commands.
 """
 import argparse
 import asyncio
@@ -42,6 +42,7 @@ VIEWS = {  # view -> (title, subtitle, refresh seconds, span seconds)
 CHIPS = (("buy", "fill('buy ')"), ("sell", "fill('sell ')"), ("deposit", "fill('deposit ')"),
          ("withdraw", "fill('withdraw ')"), ("move", "fill('move ')"), ("status", "run('status')"),
          ("help", "run('help')"))
+ALLOC = {"BTC": AMBER, "ETH": "#ffd98c", "SOL": "#c7862b", "XRP": "#8f6a35", "BETS": CYAN}  # bets speak cyan
 TRADE_EVENTS = {"entry", "exit", "scale_up", "manual_buy", "manual_sell", "KILL_SWITCH"}
 
 
@@ -73,6 +74,39 @@ COIN_WS = {"BTC": ("BTC/USD", "BTC-USD"), "ETH": ("ETH/USD", "ETH-USD"), "SOL": 
 
 
 SYM_COIN = {v: c for c, pair in COIN_WS.items() for v in pair}
+
+
+def live_odds(call, price, now=None):
+    """Chance a 15-minute window ends above its starting price; same formula as btcbot.calls.live_odds
+    (kept here so the terminal client doesn't import the model stack)."""
+    if not call or not call.get("start") or not price or not (call.get("sigma1m") or 0) > 0:
+        return None
+    t0 = datetime.fromisoformat(call["from"]).timestamp()
+    t1 = datetime.fromisoformat(call["until"]).timestamp()
+    rem = t1 - (now or time.time())
+    if rem <= 0:
+        return 1.0 if price >= call["start"] else 0.0
+    frac = min(rem / (t1 - t0), 1.0)
+    r = rem / 60
+    te = r - 2 / 3 if r > 1 else r ** 3 / 3  # the 60-second settlement average
+    z = math.log(price / call["start"]) / (call["sigma1m"] * math.sqrt(te))
+    x = (call.get("a0", 1.0) + call.get("a1", 0.0) * frac) * z + (call.get("z0") or 0.0) * math.sqrt(frac)
+    return min(0.98, max(0.02, 0.5 * (1 + math.erf(x / math.sqrt(2)))))
+
+
+def kalshi_cents(call):
+    """Kalshi's live 'yes' (up) price for the same window, in cents, or None."""
+    k = (call or {}).get("kalshi")
+    if not k or datetime.fromisoformat(k["from"].replace("Z", "+00:00")) != datetime.fromisoformat(call["from"]):
+        return None
+    mid = (k["yes_bid"] + k["yes_ask"]) / 2 if k.get("yes_bid") is not None and k.get("yes_ask") is not None else k.get("last")
+    return None if mid is None else round(mid * 100)
+
+
+def verdict(p):
+    """A 15-minute chance of 'up' in words."""
+    return ("very likely up" if p >= 0.8 else "likely up" if p >= 0.6 else "toss-up" if p > 0.4
+            else "likely down" if p > 0.2 else "very likely down")
 
 
 def link(style, action):
@@ -182,7 +216,31 @@ def bucket_bars(bars, cols):
     return out
 
 
-def render_chart(width, height, view, data, ticks, last, status, fills):
+FC_KEYS = ("mu", "q10", "q25", "q50", "q75", "q90")
+
+
+def fc_at(fc, h):
+    """Forecast at h minutes ahead: the server's horizons interpolated on log-time (spread ~ sqrt(t) below the first)."""
+    pts = fc["points"]
+    if h <= 0:
+        return dict.fromkeys(FC_KEYS, 0.0)
+    if h <= pts[0]["h"]:
+        a = pts[0]
+        r = h / a["h"]
+        return {k: a["mu"] * r + (a[k] - a["mu"]) * math.sqrt(r) for k in FC_KEYS}
+    for a, b in zip(pts, pts[1:]):
+        if h <= b["h"]:
+            w = (math.log(h) - math.log(a["h"])) / (math.log(b["h"]) - math.log(a["h"]))
+            return {k: a[k] + (b[k] - a[k]) * w for k in FC_KEYS}
+    return {k: pts[-1][k] for k in FC_KEYS}
+
+
+def ahead_label(sec):
+    return f"{round(sec / 60)}m" if sec < 3600 else f"{sec / 3600:.1f}h" if sec < 36000 else \
+        f"{sec / 3600:.0f}h" if sec < 172800 else f"{sec / 86400:.1f}d"
+
+
+def render_chart(width, height, view, data, ticks, last, status, fills, forecast=None):
     g = Grid(max(width, 20), max(height, 6))
     W, H = g.w, g.h
     axis = 9
@@ -194,9 +252,7 @@ def render_chart(width, height, view, data, ticks, last, status, fills):
         g.text(0, 1, "tuning in…", DIM)
         return g.render()
     span = VIEWS[view][3]
-    pol = status.get("policy") if status else None
     st = status.get("state", {}) if status else {}
-    sig = st.get("signal")
 
     bars = pts = None
     if data["kind"] == "candles":
@@ -223,15 +279,12 @@ def render_chart(width, height, view, data, ticks, last, status, fills):
         return g.render()
     span0 = max(hi - lo, (p0 or hi) * 0.002)
     cone = None
-    if sig and p0 and pol:
-        drift = 0.0 if pol["model"] == "momentum" else sig["pred"]
-        horizon = sig.get("horizon") or pol["horizon"]
+    if forecast and forecast.get("points") and p0:
         secs_per_col = (t1 - t0) / plot_w
-        f_max = min(1.0, future * secs_per_col / (horizon * 3600))
-        cone = (drift, sig["sigma_h"], horizon, f_max, secs_per_col)
-        fv = min(1.0, span * 0.25 / (horizon * 3600))
-        hi = min(max(hi, p0 * math.exp(drift * fv + sig["sigma_h"] * math.sqrt(fv))), hi + span0 * 1.2)
-        lo = max(min(lo, p0 * math.exp(drift * fv - sig["sigma_h"] * math.sqrt(fv))), lo - span0 * 1.2)
+        cone = (forecast, secs_per_col, max(60.0, (future - 1) * secs_per_col))
+        v = fc_at(forecast, span * 0.25 / 60)
+        hi = min(max(hi, p0 * math.exp(v["q90"])), hi + span0 * 1.2)
+        lo = max(min(lo, p0 * math.exp(v["q10"])), lo - span0 * 1.2)
     pos = st.get("position")
     if pos:
         for v in (pos["entry_px"], pos.get("stop_px", 0)):
@@ -276,28 +329,22 @@ def render_chart(width, height, view, data, ticks, last, status, fills):
         for c in range(plot_w, plot_w + future):
             g.put(r, c, "╱" if (r + c) % 6 == 0 else " ", "#12313b")
         g.put(r, plot_w, "┊", "#2f6f75")
-    if cone:
-        drift, sigma, horizon, f_max, secs_per_col = cone
+    if cone:  # forecast: median path, 50% band (▒) inside the 80% band (░)
+        fc, secs_per_col, ahead = cone
         for c in range(1, future):
-            f_raw = c * secs_per_col / (horizon * 3600)
-            if f_raw > f_max + 1e-9:
+            sec = c * secs_per_col
+            if sec > ahead + 1e-9:
                 break
-            s = sigma * math.sqrt(f_raw)
-            r2a, r2b = Y(p0 * math.exp(drift * f_raw + 2 * s)), Y(p0 * math.exp(drift * f_raw - 2 * s))
-            r1a, r1b = Y(p0 * math.exp(drift * f_raw + s)), Y(p0 * math.exp(drift * f_raw - s))
+            v = fc_at(fc, sec / 60)
+            r2a, r2b = Y(p0 * math.exp(v["q90"])), Y(p0 * math.exp(v["q10"]))
+            r1a, r1b = Y(p0 * math.exp(v["q75"])), Y(p0 * math.exp(v["q25"]))
             for r in range(max(0, math.floor(r2a)), min(plot_h, math.ceil(r2b) + 1)):
                 inner = r1a - 0.5 <= r <= r1b + 0.5
                 g.put(r, plot_w + c, "▒" if inner else "░", "#3f9da2" if inner else "#245a5e")
-            g.put(round(Y(p0 * math.exp(drift * f_raw))), plot_w + c, "━", f"bold {CYAN}")
-        ahead = f_max * horizon
-        if pol["model"] == "momentum":
-            label = ("trend up, long" if sig["pred"] > 0 else "trend down, cash") if future >= 18 else \
-                    ("long" if sig["pred"] > 0 else "cash")
-        else:
-            label = f"{pct(drift)} in {horizon}h"
-        g.text(0, plot_w + 2, label[:future - 2], f"bold {CYAN}")
-        shown = f"{round(ahead * 60)}m" if ahead < 1 else f"{ahead:.0f}h"
-        g.text(1, plot_w + 2, f"next {shown}"[:future - 2], CYAN)
+            g.put(round(Y(p0 * math.exp(v["q50"]))), plot_w + c, "━", f"bold {CYAN}")
+        end = fc_at(fc, ahead / 60)
+        g.text(0, plot_w + 2, f"{ahead_label(ahead)} {pct(math.exp(end['q50']) - 1)}"[:future - 2], f"bold {CYAN}")
+        g.text(1, plot_w + 2, f"80% {pct(math.exp(end['q10']) - 1, 1)}..{pct(math.exp(end['q90']) - 1, 1)}"[:future - 2], CYAN)
 
     # history
     if bars:
@@ -361,7 +408,23 @@ class Chart(Widget):
     def render(self):
         d = self.desk
         fills = [f for f in d.fills if f["coin"] == d.coin]
-        return render_chart(self.size.width, self.size.height, d.view, d.data, d.ticks, d.last, d.status, fills)
+        fc = d.forecast if d.forecast and d.forecast.get("coin") == d.coin else None
+        return render_chart(self.size.width, self.size.height, d.view, d.data, d.ticks, d.last, d.status, fills, fc)
+
+
+class TapeCard(Static):
+    """One coin on the tape: live price, 24h move and what you hold of it. Click to show that coin."""
+
+    def __init__(self, coin):
+        super().__init__(id=f"tape-{coin}", classes="card")
+        self.coin = coin
+
+    def on_mount(self):
+        self.border_title = self.coin.lower()
+        self.border_subtitle = COIN_NAMES[self.coin]
+
+    def on_click(self):
+        self.app.switch_coin(self.coin)
 
 
 class Crawl(Static):
@@ -390,11 +453,13 @@ class Crawl(Static):
 
 
 class Prompt(Input):
-    """Command line; up/down walk the history."""
+    """Command line; up/down walk the history, left/right on an empty prompt step through the coins."""
 
     def on_key(self, event):
         desk = self.app
-        if event.key in ("up", "down") and desk.history:
+        if event.key in ("left", "right") and not self.value:
+            desk.cycle_coin(-1 if event.key == "left" else 1)
+        elif event.key in ("up", "down") and desk.history:
             desk.hist_i = len(desk.history) if desk.hist_i < 0 else desk.hist_i
             desk.hist_i = max(0, min(len(desk.history), desk.hist_i + (-1 if event.key == "up" else 1)))
             self.value = desk.history[desk.hist_i] if desk.hist_i < len(desk.history) else ""
@@ -417,7 +482,16 @@ Screen {{ background: {GLASS}; color: {AMBER}; }}
 #chg {{ width: 10; padding: 1 0 0 1; }}
 #stats {{ width: 1fr; min-width: 42; padding: 1 1 0 2; }}
 #keys {{ width: auto; padding: 0 1; }}
-#coins {{ height: 1; padding: 0 1; }}
+#tape {{ height: 5; padding: 0 1; }}
+.card {{ width: 1fr; height: 5; margin: 0 1 0 0; padding: 0 1; border: round #1f4456; background: #081b25;
+         border-title-color: {AMBER}; border-title-style: bold; border-subtitle-color: {DIM}; }}
+.card:hover {{ border: round {DIM_AMBER}; background: #0c2230; }}
+.card.sel {{ border: round {HOT}; background: #10231f; border-title-color: {HOT}; }}
+#lower {{ height: 12; }}
+#bets-win {{ width: 50; border: round #2f6f75; border-title-color: {CYAN}; border-subtitle-color: #2f8f95;
+             background: #071b22; }}
+#bets-win.alert {{ border: round {EMBER}; }}
+#bets {{ height: auto; }}
 #actions {{ height: 1; padding: 0 1; }}
 #lamps {{ width: auto; }}
 #desk {{ height: 1fr; }}
@@ -427,11 +501,13 @@ Screen {{ background: {GLASS}; color: {AMBER}; }}
 .model-win {{ border: round #2f6f75; border-title-color: {CYAN}; }}
 #chart-win {{ height: 1fr; padding: 0; }}
 #chart {{ height: 1fr; }}
-#console-win {{ height: 10; }}
+#console-win {{ width: 1fr; }}
 #console {{ height: 1fr; background: {GLASS}; scrollbar-size-vertical: 1; scrollbar-color: {DIM_AMBER};
-            scrollbar-background: {GLASS}; scrollbar-background-hover: {GLASS}; scrollbar-background-active: {GLASS}; }}
+            scrollbar-background: {GLASS}; scrollbar-background-hover: {GLASS}; scrollbar-background-active: {GLASS};
+            overflow-x: hidden; }}
 #account {{ height: auto; }}
 #model {{ height: auto; }}
+#calls {{ height: auto; }}
 #fills-win {{ height: 1fr; }}
 #prompt {{ height: 3; border: round {AMBER}; background: #030b10; color: {HOT}; padding: 0 1; }}
 #prompt:focus {{ border: round {HOT}; }}
@@ -440,6 +516,7 @@ Screen.narrow #side {{ display: none; }}
 Screen.narrow #stats {{ display: none; }}
 Screen.narrow #chg {{ display: none; }}
 Screen.narrow #pair {{ width: 13; }}
+Screen.narrow #bets-win {{ width: 42; }}
 """
 
 
@@ -470,6 +547,12 @@ class Desk(App):
         self.live = {}  # coin -> {last, chg, at} from the all-coins ticker
         self.coin_states = {}
         self.flash_up, self.flash_until = True, 0.0
+        self.tape_px, self.tape_flash = {}, {}     # coin -> last painted price, (went up, flash until)
+        self.pv = None                              # last portfolio valuation from the bot
+        self.calls_cache = None                     # last 15-minute calls from the bot
+        self.forecast = None                        # the selected coin's forecast curve
+        self.eq_shown = self.eq_target = None
+        self.bets_seen, self.bet_new = set(), {}    # coin -> highlight a freshly opened bet until
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="crawl-row"):
@@ -482,16 +565,22 @@ class Desk(App):
             yield Static(id="stats")
             yield Static(id="keys")
             yield Static(id="lamps")
-        yield Static(id="coins")
+        with Horizontal(id="tape"):
+            for c in COIN_NAMES:
+                yield TapeCard(c)
         with Horizontal(id="desk"):
             with Vertical(id="left"):
                 with Vertical(id="chart-win", classes="win"):
                     yield Chart(self, id="chart")
-                with Vertical(id="console-win", classes="win"):
-                    yield RichLog(id="console", wrap=True, markup=False, max_lines=500)
+                with Horizontal(id="lower"):
+                    with Vertical(id="console-win", classes="win"):
+                        yield RichLog(id="console", wrap=True, markup=False, max_lines=500, min_width=20)
+                    with Vertical(id="bets-win", classes="win"):
+                        yield Static(id="bets")
             with Vertical(id="side"):
                 yield Static(id="account", classes="win")
                 yield Static(id="model", classes="win model-win")
+                yield Static(id="calls", classes="win model-win")
                 with Vertical(id="fills-win", classes="win"):
                     yield Static(id="fills")
         yield Static(id="actions")
@@ -499,16 +588,20 @@ class Desk(App):
 
     def on_mount(self):
         for wid, title in (("#console-win", "console"), ("#account", "portfolio"), ("#model", "model"),
-                           ("#fills-win", "fills")):
+                           ("#fills-win", "fills"), ("#bets-win", "bets"), ("#calls", "15-min calls")):
             self.query_one(wid).border_title = title
         self.paint_keys()
         self.paint_actions()
         self.query_one("#prompt").focus()
-        self.log_line("type help for commands, or click a chart range, a coin or a command. ctrl+q quits.", CYAN)
+        self.log_line("type help for commands, or click a chart range, a coin or a command. ← → step through the coins. "
+                      "ctrl+q quits.", CYAN)
         self.run_worker(self.boot())
         self.set_interval(2.0, self.poll_status)
         self.set_interval(20.0, self.poll_notes)
+        self.set_interval(30.0, self.load_forecast)
         self.set_interval(1.0, self.repaint)
+        self.set_interval(0.25, self.paint_tape)   # lets each coin's tick flash fade on time
+        self.set_interval(0.05, self.tween)        # the portfolio total counts to its new value
         self.on_resize(None)
 
     def on_resize(self, event):
@@ -524,6 +617,7 @@ class Desk(App):
             return
         await self.poll_status()
         await self.load_view(self.view)
+        await self.load_forecast()
         await self.poll_notes()
         if self.status and not self.feeding:
             self.feeding = True
@@ -577,8 +671,22 @@ class Desk(App):
             self.since = max(self.since, e["seq"])
             self.handle_bot_event(e)
         self.query_one("#prompt").set_class(bool(st.get("pending")), "pending")
+        self.pv = st.get("portfolio") or self.pv
+        self.calls_cache = st.get("calls") or self.calls_cache
         self.paint_panels()
-        self.paint_coins()
+        self.paint_tape()
+
+    async def load_forecast(self):
+        if not self.token:
+            return
+        try:
+            coin = self.coin
+            fc = await self.get(f"/api/forecast?coin={coin}")
+            if coin == self.coin and fc.get("points"):
+                self.forecast = fc
+                self.query_one("#chart").refresh()
+        except Exception:
+            pass  # keep the last curve
 
     async def poll_notes(self):
         if self.token:
@@ -625,6 +733,7 @@ class Desk(App):
                                 if c:
                                     self.live[c] = {"last": float(k["last"]), "chg": float(k["change_pct"]) / 100,
                                                     "at": time.time()}
+                            self.paint_tape()
                         elif exchange != "kraken" and d.get("channel") == "ticker":
                             for ev in d.get("events", []):
                                 for k in ev.get("tickers", []):
@@ -643,6 +752,11 @@ class Desk(App):
     def coin_list(self):
         return self.coins_cache
 
+    def cycle_coin(self, step):
+        coins = self.coin_list()
+        if self.coin in coins and len(coins) > 1:
+            self.switch_coin(coins[(coins.index(self.coin) + step) % len(coins)])
+
     def switch_coin(self, coin):
         if coin == self.coin or coin not in self.coin_list():
             return
@@ -651,36 +765,66 @@ class Desk(App):
         self.ticks, self.last, self.prev, self.data, self.ws_at = [], None, None, None, 0.0
         if self.ws is not None:
             self.run_worker(self.ws.close())
-        self.log_line(f"showing {COIN_NAMES[coin]}", HOT)
-        self.paint_coins()
+        self.paint_tape()
         self.run_worker(self.load_view(self.view))
         self.run_worker(self.poll_status())
         self.run_worker(self.poll_notes())
+        self.forecast = None
+        self.run_worker(self.load_forecast())
 
-    def paint_coins(self):
-        coins = self.coin_states
-        t = Text()
-        for c in self.coin_list():
-            info = coins.get(c, {})
-            L = info.get("ledger") or {}
-            funded = (L.get("usd") or 0) + (L.get("qty") or 0) > 0
-            state = ("halted" if info.get("halted") else "review" if info.get("needs_review") else
-                     "unfunded" if not funded else ("held" if (info.get("position") or {}).get("manual") else "long")
-                     if info.get("position") else
-                     "manual" if info.get("auto") is False else "cash")
-            on, go = c == self.coin, f"coin('{c}')"
-            t.append(f" {c.lower()} ", style=link(f"bold {GLASS} on {AMBER}" if on else f"{AMBER} on #12303f", go))
-            t.append(f" {state:<9}", style=link(CYAN if state == "long" else EMBER if state in ("halted", "review")
-                                                else DIM, go))
-        pool = (self.status or {}).get("pool") or self.pool_cache
-        if pool:
-            self.pool_cache = pool
-            L, n = pool.get("ledger") or {}, len(pool.get("bets") or {})
-            state = ("halted" if pool.get("halted") else "review" if pool.get("needs_review") else
-                     "unfunded" if not (L.get("usd") or n) else f"${L.get('usd', 0):,.2f} cash, {n} open")
-            t.append("  bets ", style=link(f"bold {CYAN}", "run('bets')"))
-            t.append(state, style=link(EMBER if state in ("halted", "review") else CYAN, "run('bets')"))
-        self.query_one("#coins").update(t)
+    def paint_tape(self):
+        """Every coin's live price, 24h move and what you hold of it, always on screen."""
+        if not self.query(TapeCard):  # called from a timer or the feed before the screen is built
+            return
+        rows, now, narrow = (self.pv or {}).get("coins") or {}, time.time(), self.size.width < 110
+        for c in COIN_NAMES:
+            card = self.query_one(f"#tape-{c}", TapeCard)
+            card.display = c in self.coin_list() or not self.pv
+            row, lv = rows.get(c) or {}, self.live.get(c) or {}
+            fresh = lv and now - lv["at"] < 15
+            at = lv["last"] if fresh else row.get("last")  # not `last` or `px`: both name other things here
+            chg = lv["chg"] if fresh else row.get("chg24")
+            prev = self.tape_px.get(c)
+            if at is not None and prev is not None and at != prev:
+                self.tape_flash[c] = (at > prev, now + 0.7)
+            if at is not None:
+                self.tape_px[c] = at
+            up, until = self.tape_flash.get(c, (True, 0.0))
+            style = f"bold {HOT}" if now >= until else "bold #fff3dc on #4a3812" if up else f"bold {EMBER} on #3f1810"
+            t = Text()
+            t.append(px(at) if at else "—", style=style)
+            if chg is not None:
+                t.append(f"  {pct(chg)}", style=EMBER if chg < 0 else AMBER)
+            t.append("\n")
+            qty = row.get("qty") or 0
+            value = qty * (at or 0) + ((row.get("value") or 0) - qty * (row.get("last") or 0)) if row else 0
+            t.append("held ", style=DIM)
+            t.append(usd(value) if value >= 0.005 else "—", style=f"bold {AMBER}" if value >= 0.005 else DIM)
+            if row.get("trend"):
+                t.append("  ▲" if row["trend"] == "up" else "  ▼", style=AMBER if row["trend"] == "up" else EMBER)
+            if row.get("bet"):
+                t.append(" ●" if narrow else f" ● {pct(row['bet']['pnl_pct'], 1)}", style=f"bold {CYAN}")
+            call = ((self.status or {}).get("calls") or self.calls_cache or {}).get(c)
+            if call:
+                t.append("\n")
+                odds = live_odds(call, at, now)
+                left = datetime.fromisoformat(call["until"]).timestamp() - now if call.get("until") else 0
+                if call.get("error") or odds is None:
+                    t.append("15m odds unavailable", style=DIM)
+                elif left <= 0:
+                    t.append("15m window closed", style=DIM)
+                else:
+                    end = hhmm(datetime.fromisoformat(call["until"]).timestamp())
+                    t.append(f"by {end}: ", style=DIM)
+                    t.append(f"{round(odds * 100)}% up", style=f"bold {CYAN}" if odds >= 0.5 else f"bold {EMBER}")
+                    kc = kalshi_cents(call)
+                    if kc is not None:
+                        t.append(f" (Kalshi {kc}%)" if not narrow else f" K{kc}%", style="#c9a6ff")
+            card.update(t)
+            card.set_class(c == self.coin, "sel")
+            info = self.coin_states.get(c) or {}
+            card.border_subtitle = ("halted" if info.get("halted") else "review" if info.get("needs_review")
+                                    else COIN_NAMES[c])
 
     def paint_actions(self):
         t = Text()
@@ -689,6 +833,17 @@ class Desk(App):
             t.append(" ")
         t.append("click to fill the prompt, then edit and press enter", style=DIM)
         self.query_one("#actions").update(t)
+
+    def tween(self):
+        """Ease the portfolio total toward its latest value instead of jumping."""
+        if self.eq_target is None or self.eq_shown == self.eq_target:
+            return
+        if self.eq_shown is None or abs(self.eq_target - self.eq_shown) < 0.006:
+            self.eq_shown = self.eq_target
+        else:
+            self.eq_shown += (self.eq_target - self.eq_shown) * 0.28
+        if self.status:
+            self.paint_account()
 
     def on_price(self, price, t, ws=False):
         if not (price and math.isfinite(price) and math.isfinite(t)):
@@ -729,8 +884,7 @@ class Desk(App):
         st = self.status or {}
         tk = st.get("ticker") or {}
         pair = Text(f"{self.coin.lower()}/usd\n", style=f"bold {AMBER}")
-        ex = {"kraken": "kraken pro", "coinbase": "coinbase adv."}.get(st.get("exchange"), "connecting")
-        pair.append(f"{ex}\n{st.get('mode', '')} money", style=DIM)
+        pair.append(COIN_NAMES[self.coin], style=DIM)
         self.query_one("#pair").update(pair)
         if tk.get("open24") and self.last:
             chg = self.last / tk["open24"] - 1
@@ -756,6 +910,10 @@ class Desk(App):
         st = self.status or {}
         s = st.get("state", {})
         t = Text("\n")
+        pv = st.get("portfolio") or self.pv
+        if pv and self.size.width < 110:  # the portfolio panel is hidden; keep the total in view
+            t.append(f" {usd(pv['equity'])} ", style=f"bold {HOT} on #12303f")
+            t.append(" ")
         feed_on = time.time() - self.ws_at < 15
         t.append(" feed ", style=f"bold {GLASS} on {AMBER}" if feed_on else f"{DIM} on #0c2230")
         t.append(" ")
@@ -769,61 +927,17 @@ class Desk(App):
             bot_style = f"{DIM} on #0c2230"
         flip = "bot on" if s.get("auto") is False else "bot off"
         t.append(f" {bot} ", style=link(bot_style, f"fill('{flip}')") if st else bot_style)
-        t.append(" ")
-        live = st.get("mode") == "live"
-        t.append(" live money " if live else " paper ", style=f"bold {GLASS} on {EMBER}" if live else f"{DIM} on #0c2230")
+        if st.get("mode") == "paper":  # only paper trading gets a label
+            t.append(" ")
+            t.append(" paper ", style=f"{DIM} on #0c2230")
         self.query_one("#lamps").update(t)
 
     def paint_panels(self):
         st = self.status
         s, pol = st["state"], st["policy"]
-        L = s.get("ledger", {})
-        last = self.last
-        a = Text()
-        pv = st.get("portfolio")
-        if pv:  # headline: the whole portfolio (all coins + bet pool), P&L vs money actually put in
-            pnl, basis = pv["pnl"], pv["basis"]
-            a.append_text(big_number(f"{pv['equity']:,.2f}", f"bold {HOT}"))
-            a.append(f"\n{'+' if pnl >= 0 else '−'}${abs(pnl):,.2f} ({pct(pnl / basis if basis else 0, 1)}) all coins\n",
-                     style=f"bold {EMBER if pnl < 0 else AMBER}")
-            parts = "  ".join(f"{'bets' if k == 'BETS' else k.lower()} {usd(v)}" for k, v in pv["parts"].items() if v >= 0.01)
-            a.append(parts + "\n", style=DIM)
-            a.append(f"{'coin':<4}{'price':>10}{'24h':>8}{'held':>9}\n", style=DIM)  # rows end in " ↑•": 34 cells, the panel width
-            for c, row in (pv.get("coins") or {}).items():  # live market row per coin
-                lv = self.live.get(c) or {}
-                fresh = lv and time.time() - lv["at"] < 15
-                row_px = lv["last"] if fresh else row.get("last")  # not `last`: that is the selected coin's price
-                chg = lv["chg"] if fresh else row.get("chg24")
-                held = row.get("qty") or 0
-                value = held * (row_px or 0)
-                arrow = "↑" if row.get("trend") == "up" else "↓" if row.get("trend") == "down" else " "
-                sel, go = c == self.coin, f"coin('{c}')"  # the whole row switches to that coin
-                a.append(f"{c.lower():<4}", style=link(f"bold {HOT}" if sel else AMBER, go))
-                a.append(f"{px(row_px):>10}", style=link(f"bold {HOT}" if sel else AMBER, go))
-                a.append(f"{pct(chg, 2):>8}", style=link(EMBER if (chg or 0) < 0 else AMBER, go))
-                a.append(f"{(usd(value) if held else '—'):>9}", style=link(AMBER if held else DIM, go))
-                a.append(f" {arrow}", style=link(CYAN if arrow == "↑" else EMBER, go))
-                if row.get("bet"):
-                    a.append("•", style=link(f"bold {CYAN}", go))
-                a.append("\n")
-        if last:
-            a.append(f"{self.coin.lower() + ' sleeve':<13}", style=DIM)
-            a.append(f"{usd(L['usd'] + L['qty'] * last):>21}\n", style=AMBER)
-        pos = s.get("position")
-        rows = [("sleeve cash", usd(L.get("usd"))),
-                (COIN_NAMES.get(self.coin, self.coin.lower()), f"{L.get('qty', 0):.6g} ≈ {usd(L.get('qty', 0) * (last or 0))}"),
-                ("position", (f"{'manual' if pos.get('manual') else 'long'} @ {pxr(pos['entry_px'])}")
-                 if pos else "flat"),
-                ("stop", pxr(pos["stop_px"]) if pos and pos.get("stop_px", 0) > pos["entry_px"] * 0.01 else "—"),
-                ("paid in fees", usd(L.get("fees")))]
-        for k, v in rows:
-            a.append(f"{k:<13}", style=DIM)
-            a.append(f"{v:>21}\n", style=AMBER)
-        if s.get("halted") or s.get("needs_review"):
-            a.append(f"\n{s.get('needs_review') or 'kill switch engaged'}. type resume once checked.\n",
-                     style=f"bold {EMBER}")
-        self.query_one("#account").update(a)
-
+        self.paint_account()
+        self.paint_bets()
+        self.paint_calls()
         m = Text()
         sig = s.get("signal")
         name = f"{pol['sma_days']}-day trend rule" if pol["model"] == "momentum" else f"{pol['model']}, {pol['horizon']}h"
@@ -843,10 +957,13 @@ class Desk(App):
         else:
             m.append("waiting for the first hourly signal\n", style=CYAN)
         nxt = (time.time() // 3600 + 1) * 3600 + 20 - time.time()
-        gate = ("ml failed; rule" if pol["model"] == "momentum" else "passed" if pol.get("gate_pass")
-                else "failed; watching" if st["mode"] == "live" else "failed; paper only")
+        # which strategy trades, and why: ML models only trade if they beat the fees on unseen data
+        strategy = ("trend rule" if pol["model"] == "momentum" else "ML model" if pol.get("gate_pass")
+                    else "ML, watching only" if st["mode"] == "live" else "ML, paper only")
+        ml = "lost to fees" if pol["model"] == "momentum" or not pol.get("gate_pass") else "beat fees"
         for k, v in (("next decision", f"in {int(nxt // 60)}m {int(nxt % 60):02d}s"),
-                     ("round trip cost", f"{pol['round_trip'] * 100:.2f}%"), ("go-live gate", gate)):
+                     ("round trip cost", f"{pol['round_trip'] * 100:.2f}%"), ("trading on", strategy),
+                     ("ML models", ml)):
             m.append(f"{k:<16}", style=DIM)
             m.append(f"{v:>18}\n", style=AMBER)
         self.query_one("#model").update(m)
@@ -857,6 +974,185 @@ class Desk(App):
             f.append(f"{x['coin'].lower():<4}{x['size']:<10.4g}@ {pxr(x['price']):<8}", style=AMBER)
             f.append(f" {hhmm(x['t'])}\n", style=DIM)
         self.query_one("#fills").update(f if self.fills else Text("no trades yet", style=DIM))
+
+    def paint_account(self):
+        """Portfolio: the total, P&L on what was put in, where the money is, then the coin on screen."""
+        st = self.status
+        s = st["state"]
+        L, last, W = s.get("ledger", {}), self.last, 34
+        a = Text()
+        pv = st.get("portfolio") or self.pv
+        if pv:
+            self.eq_target = pv["equity"]
+            shown = self.eq_shown if self.eq_shown is not None else pv["equity"]
+            a.append_text(big_number(f"{shown:,.2f}", f"bold {HOT}"))
+            pnl, basis = pv["pnl"], pv["basis"]
+            a.append(f"\n{'+' if pnl >= 0 else '−'}${abs(pnl):,.2f} ({pct(pnl / basis if basis else 0, 1)})",
+                     style=f"bold {EMBER if pnl < 0 else AMBER}")
+            a.append(f"  of {usd(basis)} in\n", style=DIM)
+            parts = [(k, v) for k, v in pv["parts"].items() if v >= 0.01]
+            total = sum(v for _, v in parts) or 1
+            widths = [max(1, round(v / total * W)) for _, v in parts]
+            widths[widths.index(max(widths))] += W - sum(widths) if widths else 0
+            for (k, _), w in zip(parts, widths):
+                a.append("▆" * w, style=ALLOC.get(k, DIM))
+            a.append("\n")
+            for k, v in parts:  # legend; a coin's line switches to that coin
+                go = None if k == "BETS" else f"coin('{k}')"
+                sel = k == self.coin
+                a.append("■ ", style=link(ALLOC.get(k, DIM), go) if go else ALLOC.get(k, DIM))
+                label = f"{'bets' if k == 'BETS' else k.lower():<8}{usd(v):>14}{round(v / total * 100):>9}%"
+                a.append(label + "\n", style=link(f"bold {HOT}" if sel else AMBER, go) if go else CYAN)
+        a.append(f"\n{COIN_NAMES.get(self.coin, self.coin.lower())} sleeve\n", style=f"bold {AMBER}")
+        pos = s.get("position")
+        qty = L.get("qty", 0)
+        since = f" {pct(last / pos['entry_px'] - 1, 1)}" if pos and last else ""
+        rows = [("holding", f"{qty:.6g} · {usd(qty * (last or 0))}" if qty else "none"),
+                ("cash", usd(L.get("usd"))),
+                ("position", (f"{'manual' if pos.get('manual') else 'long'} @ {pxr(pos['entry_px'])}{since}")
+                 if pos else "flat"),
+                ("stop", pxr(pos["stop_px"]) if pos and pos.get("stop_px", 0) > pos["entry_px"] * 0.01 else "—"),
+                ("fees paid", usd(L.get("fees")))]
+        for k, v in rows:
+            a.append(f"{k:<10}", style=DIM)
+            a.append(f"{v:>24}\n", style=EMBER if k == "position" and pos and last and last < pos["entry_px"] else AMBER)
+        if s.get("halted") or s.get("needs_review"):
+            a.append(f"\n{s.get('needs_review') or 'kill switch engaged'}. type resume once checked.\n",
+                     style=f"bold {EMBER}")
+        self.query_one("#account").update(a)
+
+    def paint_calls(self):
+        """15-minute up/down calls: recommendations with their tested and live record (never traded)."""
+        calls = (self.status or {}).get("calls") or self.calls_cache
+        box = self.query_one("#calls")
+        box.display = bool(calls)
+        if not calls:
+            return
+        now = time.time()
+        any_call = next((k for k in calls.values() if k.get("until")), None)
+        if any_call:
+            left = datetime.fromisoformat(any_call["until"]).timestamp() - now
+            span = f"{hhmm(datetime.fromisoformat(any_call['from']).timestamp())}–{hhmm(datetime.fromisoformat(any_call['until']).timestamp())}"
+            box.border_subtitle = f"{span} · {int(max(left, 0) // 60)}m {int(max(left, 0) % 60):02d}s left"
+        t, n, hits, net, tested = Text(), 0, 0, 0.0, []
+        for c in self.coin_list():
+            k = calls.get(c)
+            if not k:
+                continue
+            go = f"coin('{c}')"
+            lv = self.live.get(c) or {}
+            row = ((self.pv or {}).get("coins") or {}).get(c) or {}
+            price = lv["last"] if lv and now - lv["at"] < 15 else row.get("last")
+            odds = live_odds(k, price, now)
+            t.append(f"{c.lower():<4}", style=link(f"bold {CYAN}", go))
+            if odds is None:
+                t.append("no odds right now\n", style=link(DIM, go))
+            else:
+                col = f"bold {CYAN}" if odds >= 0.6 else f"bold {EMBER}" if odds <= 0.4 else f"bold {HOT}"
+                t.append(f"{round(odds * 100):>3}% ", style=link(col, go))
+                t.append(f"{verdict(odds):<16}", style=link(col, go))
+                kc = kalshi_cents(k)
+                t.append(f"{'' if kc is None else 'K ' + str(kc) + '%':>6}", style=link("#c9a6ff", go))
+                if k.get("dir"):
+                    t.append("•", style=link(f"bold {CYAN}", go))
+                t.append("\n")
+            r = k.get("record") or {}
+            n += r.get("n") or 0; hits += r.get("hits") or 0; net += r.get("net_bp") or 0
+            if (k.get("tested") or {}).get("hit_rate") is not None:
+                tested.append(k["tested"])
+        t.append("% = chance it ends the 15 min higher\nthan it started · K = Kalshi's odds\n", style=DIM)
+        if n:
+            t.append(f"• model's opening calls: {hits} of {n} right\n", style=DIM)
+        if tested:
+            hr = sum(x["hit_rate"] for x in tested) / len(tested)
+            t.append(f"tested: right {hr:.0%}, lost money after fees\n", style=DIM)
+        t.append("information only; never traded", style=DIM)
+        box.update(t)
+
+    def paint_bets(self):
+        """The short-term bet pool: totals, one card per open bet, and how close the rest are to a bet."""
+        st = self.status or {}
+        pool = st.get("pool")
+        win = self.query_one("#bets-win")
+        win.display = bool(pool)
+        if not pool:
+            return
+        L, bets, now = pool.get("ledger") or {}, pool.get("bets") or {}, time.time()
+        state = ("halted" if pool.get("halted") else "needs review" if pool.get("needs_review")
+                 else "paused" if pool.get("auto") is False else "betting")
+        win.border_subtitle = (f"{state}, {'long + short' if pool.get('shorts') else 'long only'}"
+                               f"{', sells coins to fund' if pool.get('autofund', True) else ''}")
+        win.set_class(state in ("halted", "needs review"), "alert")
+        W = win.content_size.width or 44
+        eq = ((st.get("portfolio") or self.pv or {}).get("parts") or {}).get("BETS")
+        realized = L.get("realized") or 0
+        t = Text()
+        head = [("pool ", usd(eq), f"bold {CYAN}"), ("  cash ", usd(L.get("usd")), CYAN), ("  open ", str(len(bets)), CYAN),
+                ("  made ", f"{'+' if realized >= 0 else '−'}${abs(realized):,.2f}", EMBER if realized < 0 else CYAN)]
+        if sum(len(k) + len(v) for k, v, _ in head) > W:
+            del head[1]  # narrow panel: free cash is the first thing to go
+        for k, v, style in head:
+            t.append(k, style=DIM)
+            t.append(v, style=style)
+        t.append("\n")
+        for c in list(self.bets_seen - set(bets)):
+            self.bets_seen.discard(c)
+        for c, b in bets.items():
+            if c not in self.bets_seen:
+                self.bets_seen.add(c)
+                if self.pv is not None and st.get("events") is not None:
+                    self.bet_new[c] = now + 4  # glow a freshly opened bet for a few seconds
+            lv = self.live.get(c) or {}
+            at = lv.get("last") or (((self.pv or {}).get("coins") or {}).get(c) or {}).get("last") or b["entry_px"]
+            side = 1 if b["side"] > 0 else -1
+            ret, pnl = (at / b["entry_px"] - 1) * side, b["qty"] * (at - b["entry_px"]) * side
+            start = datetime.fromisoformat(str(b.get("bar_close") or b["opened"]).replace(" ", "T")).timestamp()
+            end = start + b["H"] * 3600
+            done = min(1.0, max(0.0, (now - start) / (end - start)))
+            glow = now < self.bet_new.get(c, 0)
+            go = f"coin('{c}')"
+            head = f" {c.lower()} {'long' if side > 0 else 'short'} {usd(b['stake'])}"
+            tail = f"{pct(ret)}  {'+' if pnl >= 0 else '−'}${abs(pnl):,.2f} "
+            col = EMBER if ret < 0 else CYAN
+            t.append(head, style=link(f"bold #c9fbfd on {'#14545a' if glow else '#0c2a31'}", go))
+            t.append(" " * max(1, W - len(head) - len(tail)), style=link(f"on {'#14545a' if glow else '#0c2a31'}", go))
+            t.append(tail, style=link(f"bold {col} on {'#14545a' if glow else '#0c2a31'}", go))
+            t.append("\n")
+            left = max(0, end - now)
+            label = f" {int(left // 3600)}h {int(left % 3600 // 60):02d}m left"
+            bar = W - len(label)
+            n = round(done * bar)
+            t.append("━" * n, style=f"bold {CYAN}")
+            t.append("─" * (bar - n), style="#1d4a50")
+            t.append(label + "\n", style=DIM)
+            to_stop = b["stop_px"] / at - 1 if side > 0 else at / b["stop_px"] - 1
+            t.append(f"{pxr(b['entry_px'])} → {pxr(at)}".ljust(W - 18), style=DIM)
+            t.append(f"stop {pxr(b['stop_px'])} {pct(to_stop, 1)}".rjust(18) + "\n", style=DIM)
+        sigs, models = pool.get("signals") or {}, pool.get("models") or {}
+        for c in self.coin_list():
+            if c in bets or c not in models:
+                continue
+            p, thr = (sigs.get(c) or {}).get("p_up"), models[c]["threshold"]
+            M = 14
+            t.append(f"{c.lower():<4}", style=link(CYAN, f"coin('{c}')"))
+            lvl = 0 if p is None else round(min(1, max(0, (p - 0.3) / 0.5)) * M)
+            mark = round(min(1, max(0, (thr - 0.3) / 0.5)) * M)
+            for i in range(M):
+                ch = "┃" if i == mark else "▮" if i < lvl else "▯"
+                t.append(ch, style=AMBER if i == mark else (f"bold {CYAN}" if p is not None and p >= thr else "#2f8f95")
+                         if i < lvl else "#1d4a50")
+            if p is not None and p >= thr and (L.get("usd") or 0) < 1:  # wants a bet the pool can't pay for
+                rows = (self.pv or {}).get("coins") or {}
+                can = any((r.get("value") or 0) - (r.get("qty") or 0) * (r.get("last") or 0) >= 6
+                          or (k != c and (r.get("qty_trend") or 0) * (r.get("last") or 0) >= 6) for k, r in rows.items())
+                why = ("no free cash" if not pool.get("autofund", True) else "raises stake next hour" if can
+                       else f"nothing but {c.lower()} to sell")
+                t.append(f" {round(p * 100)}% up · {why}\n", style=DIM_AMBER)
+            else:
+                t.append(f" {'—' if p is None else f'{round(p * 100)}%'} up · bets at {round(thr * 100)}%\n", style=DIM)
+        if not bets and not any(c in models for c in self.coin_list()):
+            t.append("no bets open\n", style=DIM)
+        self.query_one("#bets").update(t)
 
     @staticmethod
     def gauge(val, entry, R, w):
@@ -928,6 +1224,11 @@ class Desk(App):
         elif ev == "pool_startup":
             self.log_line(f"bet pool online: {usd(e['ledger']['usd'])} cash, betting on {', '.join(e['coins']).lower()}"
                           f"{' (long and short)' if e.get('shorts') else ' (long only)'}", CYAN, t)
+        elif ev == "sell_for_bet":
+            self.log_line(f"sold {float(f['size']):.6g} {e.get('coin', 'BTC').lower()} at {px(f['price'])} "
+                          f"(fee {usd(f['fee'])}) to fund a {e['bet'].lower()} bet", HOT, t)
+            self.fills.append({"t": t, "price": f["price"], "size": float(f["size"]), "side": "sell",
+                               "coin": e.get("coin", "BTC")})
         elif ev in ("entry_unfilled", "scale_up_unfilled"):
             self.log_line("entry order expired unfilled; staying flat", CYAN, t)
         elif ev == "exit_unfilled":

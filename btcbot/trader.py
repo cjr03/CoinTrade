@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ART = ROOT / "artifacts"
 STATE = ROOT / "state"
 LATE_MINUTES = 15  # a bar is only traded within this many minutes of its close (as backtested)
+BET_MAX_SHARE = float(os.environ.get("BTCBOT_BET_MAX_SHARE", 0.25))  # lifetime cap on cash given to the bet pool
 log = logging.getLogger("btcbot")
 
 
@@ -598,13 +599,16 @@ class Portfolio:
             self.traders[c] = t
         first = next(iter(self.traders.values()))
         self.live, self.exchange, self.policy = first.live, exchange, first.policy
+        self._fund_lock = threading.Lock()  # one bet at a time may sell coin for its stake
         if bets:
             from .bets import BetPool
             self.pool = BetPool(mode, exchange, coins, STATE, sink=self._sink,
                                 reserved_elsewhere=lambda: sum(t.ledger["usd"] for t in self.traders.values()))
+            self.pool.funder = self.fund_bet
         self._replay_trades()
 
-    REPLAY = ("entry", "exit", "scale_up", "manual_buy", "manual_sell", "KILL_SWITCH", "bet_open", "bet_close")
+    REPLAY = ("entry", "exit", "scale_up", "manual_buy", "manual_sell", "sell_for_bet", "KILL_SWITCH", "bet_open",
+              "bet_close")
 
     def _replay_trades(self, keep=60):
         """Seed the UI's event feed with recent fills from the journals, so a restart doesn't blank them."""
@@ -689,6 +693,63 @@ class Portfolio:
                 t.journal(event="move", amount=usd, to=self.POOL)
                 t.save()
                 self.pool.fund(usd)
+
+    def fund_bet(self, bet_coin, want):
+        """A bet on `bet_coin` fired but the pool is `want` dollars short: raise it from the sleeves.
+        Idle sleeve cash first (free); otherwise sell just enough of the largest other coin with a maker
+        order at the ask (no taker fallback). Never sells the coin being bet on: selling BTC to bet on BTC
+        keeps the same exposure and only pays two fees. Never lets what the pool has been given exceed
+        BET_MAX_SHARE of the portfolio, so a losing pool is not refilled automatically.
+        Returns dollars added; raises ValueError/Busy saying why when it can't."""
+        with self._fund_lock:
+            pool, L = self.pool, self.pool.ledger
+            prices = {c: t.broker.quote()[0] for c, t in self.traders.items()}
+            total = sum(t.equity(prices[c]) for c, t in self.traders.items()) + pool.equity(prices)
+            given = L["deposited"] - L["withdrawn"]
+            room = BET_MAX_SHARE * total - given
+            mins = pool.brokers[bet_coin].min_order_usd
+            want = min(want, room)
+            if want < 0.01 or want + pool.free_usd() < mins:
+                raise ValueError(f"the pool has already been given ${given:,.2f}, the {BET_MAX_SHARE:.0%} cap "
+                                 f"(${BET_MAX_SHARE * total:,.2f}); 'move' more in by hand to go past it")
+
+            def usable(c):
+                t = self.traders[c]
+                return not (t.s.get("halted") or t.s.get("needs_review") or t.s.get("withdraw_pending") or t.busy)
+
+            cash = [c for c, t in self.traders.items() if usable(c) and t.ledger["usd"] >= want]
+            if cash:
+                self.move(round(want + 0.005, 2), cash[0], self.POOL)
+                return round(want + 0.005, 2)
+            sell_usd = {c: max(want, t.broker.min_order_usd * 1.1) for c, t in self.traders.items()}  # Kraken's floor
+            sellable = sorted((c for c, t in self.traders.items() if c != bet_coin and usable(c)
+                               and t.ledger["qty"] * prices[c] >= sell_usd[c] + 0.5),
+                              key=lambda c: -self.traders[c].ledger["qty"] * prices[c])
+            if not sellable:
+                held = [c for c, t in self.traders.items() if t.ledger["qty"] * prices[c] >= want + 0.5]
+                raise ValueError(f"the only coin to sell is {bet_coin.lower()} itself (selling it to bet on it just "
+                                 "pays fees twice)" if held == [bet_coin] else
+                                 "no sleeve has idle cash or another coin to sell for the stake")
+            src = sellable[0]
+            t = self.traders[src]
+            with t._manual():
+                t.busy = f"selling for a {bet_coin} bet"
+                try:
+                    bid, ask = t.broker.quote()
+                    qty = min(sell_usd[src] * 1.006 / ask, t.ledger["qty"])  # +0.6%: the maker fee and rounding
+                    if (t.ledger["qty"] - qty) * bid < t.broker.min_order_usd:
+                        qty = t.ledger["qty"]  # never leave a remainder too small to sell
+                    fill = t._sell(lambda: t.broker.sell_maker(qty, deadline_s=600, ref_px=ask, fallback_taker=False),
+                                   "bet funding")
+                    if not fill:
+                        raise ValueError(f"the {src.lower()} sale for its stake did not fill within 10 minutes")
+                    t.journal(event="sell_for_bet", fill=fill, bet=bet_coin)
+                    t.save()
+                finally:
+                    t.busy = None
+            got = round(min(fill["size"] * fill["price"] - fill["fee"], t.ledger["usd"]) - 0.005, 2)
+            self.move(got, src, self.POOL)
+            return got
 
     # --- cross-selling ---------------------------------------------------------------------------
     def _ready(self, coins):

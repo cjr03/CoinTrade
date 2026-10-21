@@ -22,7 +22,7 @@
   <header class="quote">
     <div class="instrument">
       <span class="pair" id="pair">btc/usd</span>
-      <span class="venue" id="venue">connecting</span>
+      <span class="venue" id="coin-name">bitcoin</span>
     </div>
     <div class="readout">
       <output class="price" id="price" aria-live="off">—</output>
@@ -34,7 +34,6 @@
       <div><dt>24h high</dt><dd id="hi">—</dd></div>
       <div><dt>24h low</dt><dd id="lo">—</dd></div>
     </dl>
-    <nav class="coins" id="coins" role="tablist" aria-label="Coin"></nav>
     <nav class="keys" role="tablist" aria-label="Chart range">
       <button role="tab" data-view="10m">10m</button>
       <button role="tab" data-view="1h" aria-selected="true">1h</button>
@@ -44,9 +43,13 @@
     <div class="lamps">
       <span class="lamp" id="lamp-feed" title="Live price feed">feed</span>
       <span class="lamp" id="lamp-bot" title="Automatic trading">bot</span>
-      <span class="lamp" id="lamp-mode" title="Paper or live money">paper</span>
+      <span class="lamp" id="lamp-mode" title="Paper trading: no real orders" hidden>paper</span>
     </div>
   </header>
+
+  <nav class="tape" id="tape" role="tablist" aria-label="Coins: live price and what you hold">
+    <span class="tape-glow" id="tape-glow" aria-hidden="true"></span>
+  </nav>
 
   <main class="desk">
     <section class="win chart-win" aria-label="Price chart">
@@ -58,19 +61,17 @@
     <aside class="side">
       <section class="win" aria-label="Account">
         <h2 class="win-title">portfolio</h2>
-        <div class="equity"><output id="equity">—</output><span id="pnl"></span></div>
-        <p class="breakdown" id="breakdown"></p>
-        <table class="markets" aria-label="Live markets and holdings">
-          <thead><tr><th scope="col">coin</th><th scope="col">price</th><th scope="col">24h</th><th scope="col">held</th></tr></thead>
-          <tbody id="markets"></tbody>
-        </table>
+        <div class="equity"><output id="equity">—</output></div>
+        <p class="pnl-line"><span id="pnl"></span> <span class="muted" id="pnl-note"></span></p>
+        <div class="alloc" id="alloc" role="img" aria-label="Where the money is"></div>
+        <ul class="alloc-legend" id="alloc-legend"></ul>
+        <h3 class="sub-title" id="sleeve-label">btc sleeve</h3>
         <dl class="kv">
-          <div><dt id="sleeve-label">btc trend sleeve</dt><dd id="sleeve-eq">—</dd></div>
-          <div><dt>sleeve cash</dt><dd id="cash">—</dd></div>
-          <div><dt id="qty-label">bitcoin</dt><dd id="btc">—</dd></div>
+          <div><dt>holding</dt><dd id="btc">—</dd></div>
+          <div><dt>cash</dt><dd id="cash">—</dd></div>
           <div><dt>position</dt><dd id="pos">flat</dd></div>
           <div><dt>stop</dt><dd id="stop">—</dd></div>
-          <div><dt>paid in fees</dt><dd id="fees">—</dd></div>
+          <div><dt>fees paid</dt><dd id="fees">—</dd></div>
         </dl>
       </section>
 
@@ -87,8 +88,15 @@
         <dl class="kv">
           <div><dt>next decision</dt><dd id="countdown">—</dd></div>
           <div><dt>round trip cost</dt><dd id="cost">—</dd></div>
-          <div><dt>go-live gate</dt><dd id="gate">—</dd></div>
+          <div><dt>trading on</dt><dd id="gate">—</dd></div>
+          <div title="Every ML model was tested on 31 quarters it never trained on; none beat Kraken's fees"><dt>ML models</dt><dd id="ml">—</dd></div>
         </dl>
+      </section>
+
+      <section class="win calls-win" aria-label="15-minute calls" id="calls-win" hidden>
+        <h2 class="win-title">15-min calls <span class="win-sub" id="calls-sub"></span></h2>
+        <ol class="calls" id="calls"></ol>
+        <p class="calls-note" id="calls-note"></p>
       </section>
 
       <section class="win fills-win" aria-label="Recent fills">
@@ -100,6 +108,12 @@
     <section class="win console-win" aria-label="Console">
       <h2 class="win-title">console</h2>
       <div class="console" id="console" aria-live="polite"></div>
+    </section>
+
+    <section class="win bets-win" aria-label="Short-term bets">
+      <h2 class="win-title">bets <span class="win-sub" id="bets-sub"></span></h2>
+      <div class="bets-head" id="bets-head"></div>
+      <div class="bets" id="bets"></div>
     </section>
   </main>
 

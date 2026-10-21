@@ -44,6 +44,8 @@ trades a strategy that survives out-of-sample.
 - Live trading on Kraken Pro: post-only maker orders, HMAC-signed REST, crash-safe order recovery, and a ledger reconciled against the exchange.
 - Multi-coin sleeves: BTC, ETH, SOL and XRP each run with their own cash, position and drawdown kill switch; move, convert and rebalance money between them.
 - Short-term bet pool: per-coin calibrated up/down models place small bets only when confident enough, from a fenced pool of cash with stops.
+- 15-minute up/down odds for each coin, settled like Kalshi's 15-minute markets (60-second average price before each quarter hour vs before its end), updated live with Kalshi's own price alongside; calibrated within ~3 points on six months of unseen 1-minute data (recommendations only; the bot never trades them).
+- Forecast curves on every chart: a median path with 50% and 80% bands from 1 minute to 1 week, whose band coverage was checked on unseen data (the 80% band held 78–84% of outcomes up to a day).
 - Phosphor Desk: a live chart (10m / 1h / 1d / 1w), all-coin market table, model notes and a command line, as a clickable terminal UI and as a browser UI.
 
 ---
@@ -95,6 +97,7 @@ Out-of-sample, 31 quarterly test folds, 2019-01 to 2026-09, $100 start, Kraken f
 - **Zero-shot foundation models** scored IC −0.03 (Chronos-Bolt) and −0.08 (Chronos-2) on 2025+ data.
 - **Frequent short-term bets** (1h–24h, long and short): betting every hour turns $100 into $0; the best of 56 configurations picked in hindsight ends at $139, against $2,804 for the trend filter.
 - **Confidence-gated bets** ("only bet when the probability is high enough"), three designs: $100 → $100.59, $60.68 and $92.26. The models' 70%+ calls came true only about 53% of the time.
+- **15-minute calls** (`python -m btcbot.calls --train`, tested Jul–Oct 2026 on bars the models never saw): right 54–56% of the time when they make a call (10–19% of quarter hours), against ~50% for guessing, but they earn about nothing per call before fees (−0.1 to +0.9 bp) and lose ~79 bp after Kraken's 0.8% round trip. Shown as recommendations only.
 - **The trend filter** beats buy & hold on Sharpe and drawdown, but not significantly (bootstrap p = 0.20), and only for 50–100 day windows. Treat it as risk reduction, not alpha.
 
 Per coin, trend rule vs holding (`python -m btcbot.coin_eval`):
@@ -192,6 +195,10 @@ Give the key "Query funds" and "Query/Create/Cancel orders" permissions only, ne
 .venv/bin/python -m btcbot.evaluate --fees kraken_0.40_0.80
 .venv/bin/python -m btcbot.train --final --model lgbm --horizon 72
 .venv/bin/python -m btcbot.bets --train                # short-term bet pool models
+.venv/bin/python -m btcbot.data --products BTC-USD,ETH-USD,SOL-USD,XRP-USD --granularity FIFTEEN_MINUTE --days 730
+.venv/bin/python -m btcbot.calls --train               # 15-minute call models
+.venv/bin/python -m btcbot.data --products BTC-USD,ETH-USD,SOL-USD,XRP-USD --granularity ONE_MINUTE --days 180
+.venv/bin/python -m btcbot.forecast --fit             # chart forecast bands
 .venv/bin/python -m btcbot.coin_eval                   # per-coin trend vs hold
 .venv/bin/python -m pytest -q tests
 ```
@@ -216,7 +223,7 @@ http://127.0.0.1:8787
 ## Usage
 
 - Start the bot, then open either desk; any number of desks can watch at once.
-- Click a chart range (10m / 1h / 1d / 1w), a coin, or a coin's row in the portfolio panel to switch views.
+- Click a chart range (10m / 1h / 1d / 1w) or a coin card to switch views; with an empty prompt, ← / → step through btc, eth, sol and xrp (↑ / ↓ walk your command history).
 - Click a command chip (buy, sell, deposit, withdraw, move) to fill the prompt, finish the amount, and press enter. In live mode, money commands ask for a `confirm CODE` first.
 - Type `help` for every command:
 
