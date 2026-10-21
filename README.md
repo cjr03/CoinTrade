@@ -1,163 +1,288 @@
 # CoinTrade
+![Python](https://img.shields.io/badge/Python_3.12-blue)
+![LightGBM](https://img.shields.io/badge/LightGBM-green)
+![scikit-learn](https://img.shields.io/badge/scikit--learn-orange)
+![pandas](https://img.shields.io/badge/pandas-purple)
+![Chronos](https://img.shields.io/badge/Chronos_Bolt_%26_Chronos--2-black)
+![Kraken Pro](https://img.shields.io/badge/Kraken_Pro_API-purple)
+![Coinbase](https://img.shields.io/badge/Coinbase_Advanced_Trade-blue)
+![Textual](https://img.shields.io/badge/Textual_TUI-teal)
+![JavaScript](https://img.shields.io/badge/JavaScript_Canvas-yellow)
 
-Crypto price-prediction research and an automated trader for BTC, ETH, SOL and XRP on Kraken Pro
-(or Coinbase Advanced Trade), with a retro terminal and browser trading desk.
+CoinTrade is a crypto price-prediction research pipeline and an automated trader for Bitcoin, Ethereum,
+Solana and XRP on Kraken Pro (or Coinbase Advanced Trade), with a retro trading desk in the terminal and
+in the browser. It tests state-of-the-art forecasting models honestly against exchange fees and only
+trades a strategy that survives out-of-sample.
 
-Research-backed pipeline: data → causal features → purged walk-forward training → fee-aware
-backtest with a go-live gate → hourly trader (paper or live). The Python package is `btcbot`.
+> **Risk notice.** This trades real money when you switch it to live mode. Every test in this project
+> says short-term prediction does not beat exchange fees; the deployed rule is a simple trend filter
+> that cut drawdowns in backtests but did not significantly beat holding. Nothing here is financial
+> advice. Start in paper mode.
 
-> **Risk notice.** This trades real money when you switch it to live mode. Every test in this
-> project says short-term prediction does not beat exchange fees; the deployed rule is a simple
-> trend filter that cut drawdowns in backtests but did not significantly beat holding. Nothing
-> here is financial advice. Start in paper mode.
+---
 
-## Results (out-of-sample, 31 quarterly test folds, 2019-01 → 2026-09, $100 start)
+## Table of Contents
 
-| Strategy (Kraken fees 0.40% maker / 0.80% taker) | CAGR | Sharpe | Max DD | Trades/yr |
+- [Features](#features)
+- [Demo](#demo)
+- [Project Story](#project-story)
+- [Results & Impact](#results--impact)
+- [Tech Stack](#tech-stack)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+- [Usage](#usage)
+- [Folder Structure](#folder-structure)
+- [Author](#author)
+- [Acknowledgments](#acknowledgments)
+
+---
+
+## Features
+
+- Research pipeline: strictly causal hourly features, purged walk-forward training over 31 quarterly test folds (2019–2026), and a fee-aware backtest with a block bootstrap.
+- Model shoot-out: LightGBM (regression and triple-barrier), Ridge, and zero-shot foundation models (Chronos-Bolt, Chronos-2), all judged by the same go-live gate.
+- Live trading on Kraken Pro: post-only maker orders, HMAC-signed REST, crash-safe order recovery, and a ledger reconciled against the exchange.
+- Multi-coin sleeves: BTC, ETH, SOL and XRP each run with their own cash, position and drawdown kill switch; move, convert and rebalance money between them.
+- Short-term bet pool: per-coin calibrated up/down models place small bets only when confident enough, from a fenced pool of cash with stops.
+- Phosphor Desk: a live chart (10m / 1h / 1d / 1w), all-coin market table, model notes and a command line, as a clickable terminal UI and as a browser UI.
+
+---
+
+## Demo
+
+**Terminal desk** (`./tui.sh`): live price, the model's projection cone, the portfolio across all four coins, and clickable command chips.
+
+<img src="docs/tui.png" width="800px">
+
+**Terminal desk, one-day view**
+
+<img src="docs/tui_1d.png" width="800px">
+
+**Browser desk** (http://127.0.0.1:8787)
+
+<img src="docs/web.png" width="800px">
+
+---
+
+## Project Story
+
+The brief was to build a state-of-the-art Bitcoin price-prediction model and an app that buys and sells
+at the best possible time, starting with $100 and free to trade as often as it likes. The research went
+looking for the best available models (gradient-boosted trees, linear baselines, and foundation models
+like Amazon's Chronos) and put every one of them through the same strict test: train only on the past,
+pay real exchange fees, and beat simply holding.
+
+None of the machine-learning models passed. They were right slightly more often than chance, but the
+edge was far smaller than the 0.8% it costs to buy and sell. So the live bot trades the one rule that
+held up, a 50-day trend filter, and keeps the ML research, the short-term bets and the evidence for
+anyone who wants to try to beat it.
+
+---
+
+## Results & Impact
+
+Out-of-sample, 31 quarterly test folds, 2019-01 to 2026-09, $100 start, Kraken fees (0.40% maker / 0.80% taker):
+
+| Strategy | CAGR | Sharpe | Max drawdown | Trades/yr |
 |---|---|---|---|---|
 | Buy & hold | +49.5% | 0.96 | −77% | – |
-| **SMA-50 trend filter** (long when daily close > 50d SMA) | **+53.7%** | **1.20** | −61% | 9.7 |
+| **SMA-50 trend filter** (long when daily close > 50-day average) | **+53.7%** | **1.20** | −61% | 9.7 |
 | SMA-100 trend filter | +50.1% | 1.13 | −44% | 6.4 |
 | Best ML: LightGBM / Ridge, 12h horizon | +2.0% | 0.23 | −16% | 7 |
-| Validation-selected ML: LightGBM, 72h (deployed ML policy) | −1.1% | −0.06 | −19% | 1 |
+| Validation-selected ML: LightGBM, 72h | −1.1% | −0.06 | −19% | 1 |
 
-* **No ML configuration passed the go-live gate** at any fee level (Coinbase 0.60/1.20,
-  0.40/0.60, Kraken 0.40/0.80). Out-of-sample IC is ≈ 0.01–0.03; the model is right
-  slightly more often than chance but the edge is far below the ~0.8–1.2% round-trip cost.
-* Zero-shot foundation models (Chronos-Bolt, Chronos-2) scored IC −0.03 / −0.08 on 2025+.
-* Frequent short-term up/down bets (1h/4h/12h/24h horizons, long and short, generous all-maker
-  fills) were tested separately: betting every hour turns $100 into $0.00; the best of 56
-  configurations picked in hindsight ends at $139 vs $2,804 for the trend filter. The models are
-  right 52–57% of the time, but capture 1–12 bp per bet against an 80 bp round trip.
-* Confidence-gated bets ("only bet when the probability is high enough"), three designs with
-  validation-only thresholds and an independent audit: calibrated up/down probability $100 → $100.59
-  (flat 28 of 31 quarters), cost-aware "profitable move" classifiers → $60.68, take-profit/stop bets
-  → $92.26. The models' 70%+ calls came true only ~53% of the time.
-* The trend filter beats buy & hold on Sharpe and drawdown, but **not significantly**
-  (bootstrap p = 0.20) and only for 50–100 day windows (20 and 200 lose) — treat it as a
-  risk-reduction rule, not alpha. 2019–2026 was a strong BTC bull period.
+- **No ML configuration passed the go-live gate** at any fee level tested. Out-of-sample information coefficient was about 0.01–0.03.
+- **Zero-shot foundation models** scored IC −0.03 (Chronos-Bolt) and −0.08 (Chronos-2) on 2025+ data.
+- **Frequent short-term bets** (1h–24h, long and short): betting every hour turns $100 into $0; the best of 56 configurations picked in hindsight ends at $139, against $2,804 for the trend filter.
+- **Confidence-gated bets** ("only bet when the probability is high enough"), three designs: $100 → $100.59, $60.68 and $92.26. The models' 70%+ calls came true only about 53% of the time.
+- **The trend filter** beats buy & hold on Sharpe and drawdown, but not significantly (bootstrap p = 0.20), and only for 50–100 day windows. Treat it as risk reduction, not alpha.
 
-## Coins
+Per coin, trend rule vs holding (`python -m btcbot.coin_eval`):
 
-BTC, ETH, SOL and XRP each run as a separate **sleeve** with its own cash ledger, position, kill
-switch and Kraken pair (`BTCBOT_COINS=BTC,ETH,SOL,XRP`). New sleeves start with $0; fund them with
-`move 20 btc eth` (moves bot cash between sleeves) or `deposit 20 eth`. Cash booked to one coin is
-reserved from the others, so no sleeve can spend another's money.
-
-Trend rule vs holding per coin at Kraken fees (`python -m btcbot.coin_eval`):
-
-| coin (test span) | trend CAGR / max DD | hold CAGR / max DD | auto trading by default |
+| Coin (test span) | Trend CAGR / max DD | Hold CAGR / max DD | Auto trading |
 |---|---|---|---|
 | BTC (2019–2026) | +55.3% / −58% | +48.9% / −77% | on |
 | ETH (2019–2026) | +48.8% / −59% | +45.3% / −81% | on |
 | SOL (2021–2026) | +44.2% / −73% | +8.8% / −97% | on |
-| XRP (2023–2026, Coinbase delisted it 2021–23) | +15.3% / −72% | +39.5% / −73% | **off** (manual only; `bot on xrp` to enable) |
+| XRP (2023–2026) | +15.3% / −72% | +39.5% / −73% | off (manual only) |
 
-## Cross-selling and the short-term bet pool
+---
 
-* `convert 20 btc eth` / `convert all sol xrp` sell one coin and buy another with the proceeds;
-  `rebalance btc 50 eth 30 sol 20` redistributes the sleeves' combined value to those percentages.
-  Both use market orders (about 0.8% per trade at Kraken tier 1); converted coins become your manual
-  holdings (the trend bot guards them only with the kill switch).
-* The **bet pool** (`BTCBOT_BETS=1`) places short-term up/down bets on every coin when a calibrated
-  direction model is confident enough (`python -m btcbot.bets --train`). It trades only its own cash
-  (`move 15 btc bets`), one ~$6–10 bet per coin at a time, each with a 2-sigma stop, and halts itself
-  at −50% of what was put in. Bets are **long-only** in live trading; margin shorts exist but are
-  experimental (paper only unless `BTCBOT_BET_SHORTS=1`), because margin eligibility, reduce-only
-  closes and Kraken's real rollover charges are not reconciled. Expectation, measured on the 6
-  months before training (thresholds forced to stay active):
+## Tech Stack
 
-| coin | horizon / threshold | bets per year | $100 after 6 months |
-|---|---|---|---|
-| BTC | 24h, P(up) ≥ 60% | 293 | $32 |
-| ETH | 24h, P(up) ≥ 55% | 343 | $26 |
-| SOL | 24h, P(up) ≥ 55% | 297 | $44 |
-| XRP | 12h, P(up) ≥ 55% | 30 | $95 |
+**Modeling & Research**:
+- LightGBM (Huber regression, calibrated classifiers, triple-barrier labels)
+- scikit-learn (Ridge, isotonic calibration)
+- Amazon Chronos-Bolt and Chronos-2 (zero-shot, via PyTorch)
+- pandas, NumPy, PyArrow
 
-  Treat the pool as a cost of curiosity, not a profit engine: every test in this project says these
-  bets lose to fees.
+**Trading Backend**:
+- Python 3.12
+- Kraken Pro REST + WebSocket v2 (HMAC-SHA512 signing)
+- Coinbase Advanced Trade API (market data and optional broker)
+- Local HTTP server (stdlib) with session token, Host/Origin checks and CSP
 
-## Layout
-| module | role |
-|---|---|
-| `btcbot/data.py` | Coinbase public candle downloader (1h, 5m, ETH) with parquet cache |
-| `btcbot/features.py` | strictly causal hourly features (returns, trend, vol, 5m flow, ETH, seasonality) |
-| `btcbot/train.py` | purged walk-forward: LightGBM (huber), Ridge, LightGBM triple-barrier; `--final` |
-| `btcbot/backtest.py` | event-driven long/flat sim: post-only fills, fees, stops, kill switch, bootstrap |
-| `btcbot/evaluate.py` | threshold selection on validation only, baselines, gate, policy export |
-| `btcbot/chronos_eval.py` | zero-shot Chronos-Bolt / Chronos-2 challenger |
-| `btcbot/broker.py` | Coinbase live broker + paper broker |
-| `btcbot/kraken.py` | Kraken live broker (REST, HMAC signed) + Kraken paper broker |
-| `btcbot/trader.py` | hourly loop: refresh data → signal → policy → broker; bot ledger, state + journal in `state/` |
-| `btcbot/app.py`, `btcbot/web/` | Phosphor Desk: local server, browser UI, command line, model notes |
-| `btcbot/coins.py`, `btcbot/coin_eval.py` | coin identifiers per venue; per-coin trend-vs-hold evidence |
-| `btcbot/bets.py` | short-term bet pool: per-coin calibrated models, fenced ledger, margin shorts |
-| `btcbot/tui.py` | Phosphor Desk in the terminal (Textual), a client of the local server |
+**Frontend**:
+- Textual + Rich (terminal desk)
+- HTML, CSS, JavaScript Canvas (browser desk)
+- Exchange WebSocket price feeds
 
-## Usage
-Market data, model files and your trade ledgers are not in the repository (see `.gitignore`); the
-commands below rebuild the first two, and the bot creates `state/` on its first run. Policy files
-and evaluation reports are in `artifacts/`.
-```sh
-git clone https://github.com/cjr03/CoinTrade.git && cd CoinTrade
-uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.txt
-cp .env.example .env                                  # live trading only: add your exchange keys
+**Dev tools**:
+- pytest (53 tests)
+- uv
+- Claude Code
+- Git & GitHub
+
+---
+
+## Architecture
+```mermaid
+flowchart TD
+    A[Coinbase public candles] --> B[Causal features]
+    B --> C[Purged walk-forward training]
+    C --> D[Fee-aware backtest + go-live gate]
+    D --> E[Policy file]
+    E --> F[Portfolio: BTC / ETH / SOL / XRP sleeves]
+    E --> G[Short-term bet pool]
+    F --> H[Kraken Pro broker]
+    G --> H
+    H --> I[Ledgers + journals in state/]
+    F --> J[Local server 127.0.0.1:8787]
+    G --> J
+    K[Kraken WebSocket prices] --> L[Terminal desk]
+    K --> M[Browser desk]
+    J --> L
+    J --> M
+```
+**Flow**:
+- Hourly candles are downloaded and turned into features that only use past data.
+- Models are trained and tested quarter by quarter on data they never saw, paying real fees.
+- Only a policy that passes the go-live gate is exported; today that is the 50-day trend rule.
+- Each hour, every coin's sleeve checks its trend and places post-only maker orders on Kraken.
+- The bet pool places small, stopped bets when its calibrated model is confident enough.
+- Both desks read the bot's local server and stream live prices; commands go back through the same server.
+
+---
+
+## Getting Started
+
+1. Clone the repository
+```bash
+git clone https://github.com/cjr03/CoinTrade.git
+cd CoinTrade
+```
+2. Install dependencies
+```bash
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+# optional, for the Chronos experiments: torch chronos-forecasting
+```
+3. Add environment variables in .env (live trading only; paper mode needs no keys):
+```ini
+KRAKEN_API_KEY=your_kraken_api_key_here
+KRAKEN_API_SECRET=your_kraken_private_key_here
+```
+Give the key "Query funds" and "Query/Create/Cancel orders" permissions only, never withdrawal. See `.env.example` for the other settings.
+
+4. Download data and build the models (market data and model files are not in the repository):
+```bash
 .venv/bin/python -m btcbot.data --products BTC-USD,ETH-USD,SOL-USD,XRP-USD --granularity ONE_HOUR --days 4200
 .venv/bin/python -m btcbot.data --products BTC-USD --granularity FIVE_MINUTE --days 3580
-.venv/bin/python -m btcbot.train                      # walk-forward OOS predictions
+.venv/bin/python -m btcbot.train                      # walk-forward out-of-sample predictions
 .venv/bin/python -m btcbot.evaluate --fees kraken_0.40_0.80
 .venv/bin/python -m btcbot.train --final --model lgbm --horizon 72
-.venv/bin/python -m btcbot.evaluate --horizons 72 --models lgbm --fees kraken_0.40_0.80 --export 72,lgbm,kraken_0.40_0.80
-.venv/bin/python -m btcbot.evaluate --export-momentum kraken_0.40_0.80   # writes policy.json (copy aside)
-.venv/bin/python -m btcbot.bets --train                # short-term bet pool models (artifacts/bets_*.pkl)
+.venv/bin/python -m btcbot.bets --train                # short-term bet pool models
 .venv/bin/python -m btcbot.coin_eval                   # per-coin trend vs hold
 .venv/bin/python -m pytest -q tests
 ```
-
-### Phosphor Desk (terminal and browser UI)
-```sh
-./run_live.sh          # live bot on Kraken (trend policy) + local server on 127.0.0.1:8787
-./tui.sh               # the desk in your terminal — attaches to the running bot
-./tui.sh --start       # no bot running? host one inside this terminal session instead
-# or open http://127.0.0.1:8787 in a browser
+5. Run the bot (paper by default):
+```bash
+BTCBOT_EXCHANGE=kraken BTCBOT_POLICY=policy_momentum.json BTCBOT_COINS=BTC,ETH,SOL,XRP \
+  .venv/bin/python -m btcbot.app
+# live money on Kraken: ./run_live.sh  (sets BTCBOT_MODE=live BTCBOT_CONFIRM_LIVE=I_UNDERSTAND)
 ```
-The terminal desk is a client of the running bot, so the browser and any number of terminals can
-watch at once without a second trader ever touching the account. Click a chart range (10m/1h/1d/1w),
-a coin, a market row in the portfolio panel, or a command chip above the prompt (buy, sell, deposit,
-withdraw and move fill the prompt for you to finish; status, help and bets run at once; clicking the
-bot lamp fills `bot off`/`bot on`). `↑`/`↓` command history, `ctrl+l` clear console, `ctrl+q` quit.
-Best at ≥ 110×36; narrower terminals hide the side panels but keep the money lamps.
-
-Both UIs run the hourly bot's local server and show: live BTC price (exchange
-WebSocket), chart with 10m / 1h / 1d / 1w views (click to switch) and the model's projection cone, a
-crawl of model notes (training philosophy, research results, current projection, recent
-trades), account/model/fills panels, and a command line:
-
-| command | paper | live |
-|---|---|---|
-| `buy 25`, `buy all` | market buy from bot cash | same, after `confirm CODE` |
-| `sell 25` ($ worth), `sell 50%`, `sell all`, `sell 0.0002 btc` | market sell | same, after `confirm CODE` |
-| `deposit 50` | adds paper cash | hands $50 of exchange USD to the bot (bank deposits must be started in the exchange app) |
-| `withdraw 20` | removes paper cash | Kraken: sends to your pre-verified bank account, only with `BTCBOT_ALLOW_WITHDRAW=1`, `KRAKEN_WITHDRAW_KEY=<bank name in Kraken>` and a key with Withdraw permission |
-| `bot off` / `bot on`, `resume`, `status`, `view 1d`, `clear`, `help` | | |
-
-The bot trades only its own ledger (deposits − withdrawals ± P&L), never the rest of the
-account. The server binds to 127.0.0.1 and every command needs the per-session page token.
-
-Run the trader headless instead (paper by default; state and journal go to `state/`):
-```sh
-BTCBOT_EXCHANGE=kraken BTCBOT_POLICY=policy_momentum.json .venv/bin/python -m btcbot.trader
-BTCBOT_EXCHANGE=kraken BTCBOT_POLICY=policy_ml_H72.json   .venv/bin/python -m btcbot.trader
+6. Browser desk is available at
+```arduino
+http://127.0.0.1:8787
 ```
-Live trading additionally needs `BTCBOT_MODE=live BTCBOT_CONFIRM_LIVE=I_UNDERSTAND` and API keys in
-`.env` (`KRAKEN_API_KEY`/`KRAKEN_API_SECRET` or `COINBASE_API_KEY`/`COINBASE_API_SECRET`; see
-`.env.example`). Keys need trade permissions only — never withdrawal.
+7. Terminal desk
+```bash
+./tui.sh            # attaches to the running bot
+./tui.sh --start    # or hosts a bot inside this terminal session
+```
 
-## Safety rails
-post-only maker orders priced at the decision price, never chasing it · market orders only for
-stops/kill switch · $110 per-order cap · fee guard (no entries if live fee > backtested) ·
-stale-data guard (BTC 1h, ETH 1h, 5m must be current) · open orders cancelled on startup ·
-drawdown kill switch halts until a human removes `halted` from the state file.
+---
 
-## License
-MIT, see [LICENSE](LICENSE).
+## Usage
+
+- Start the bot, then open either desk; any number of desks can watch at once.
+- Click a chart range (10m / 1h / 1d / 1w), a coin, or a coin's row in the portfolio panel to switch views.
+- Click a command chip (buy, sell, deposit, withdraw, move) to fill the prompt, finish the amount, and press enter. In live mode, money commands ask for a `confirm CODE` first.
+- Type `help` for every command:
+
+| Command | What it does |
+|---|---|
+| `buy 25 eth`, `buy all sol` | market buy with that coin's sleeve cash |
+| `sell 25`, `sell 50%`, `sell all`, `sell 0.0002 btc` | market sell |
+| `deposit 50 eth` | paper: add cash; live: hand $50 of exchange USD to that sleeve |
+| `withdraw 20` | paper: remove cash; live: send to your bank (off unless `BTCBOT_ALLOW_WITHDRAW=1`) |
+| `move 20 btc eth`, `move 15 btc bets` | move cash between sleeves or into the bet pool |
+| `convert 20 btc eth`, `convert all sol xrp` | sell one coin and buy another |
+| `rebalance btc 50 eth 30 sol 20` | redistribute everything to those percentages |
+| `bets`, `bets on/off` | bet pool status and control |
+| `bot off/on`, `resume`, `status`, `view 1d`, `coin sol`, `clear` | control and display |
+
+**Safety rails**: post-only maker orders priced at the decision price, never chasing it · market orders only for stops and the kill switch · $110 per-order cap · fee guard · stale-data guard · open orders cancelled on startup · 35% drawdown kill switch that halts until a human resumes · the bot only trades its own ledger, never the rest of the account · the server binds to 127.0.0.1 and every command needs the session token.
+
+---
+
+## Folder Structure
+
+```plaintext
+CoinTrade/
+├─ btcbot/
+│  ├─ data.py          # Coinbase public candle downloader (parquet cache)
+│  ├─ features.py      # strictly causal hourly features
+│  ├─ train.py         # purged walk-forward training, --final
+│  ├─ backtest.py      # fee-aware simulator, metrics, block bootstrap
+│  ├─ evaluate.py      # threshold selection, baselines, go-live gate, policy export
+│  ├─ chronos_eval.py  # zero-shot Chronos-Bolt / Chronos-2 challenger
+│  ├─ coin_eval.py     # per-coin trend vs hold evidence
+│  ├─ coins.py         # coin identifiers per venue
+│  ├─ broker.py        # Coinbase broker + paper broker
+│  ├─ kraken.py        # Kraken Pro live + paper broker
+│  ├─ trader.py        # per-coin sleeves and the portfolio
+│  ├─ bets.py          # short-term bet pool
+│  ├─ app.py           # local server and command line
+│  ├─ tui.py           # terminal desk (Textual)
+│  └─ web/             # browser desk (index.html, app.js, style.css)
+├─ artifacts/          # policy files and evaluation reports
+├─ docs/               # screenshots
+├─ tests/
+├─ run_live.sh
+├─ tui.sh
+├─ requirements.txt
+├─ .env.example
+├─ README.md
+└─ LICENSE
+```
+
+---
+
+## Author
+
+**Cole Roberts**
+
+*M.S. Artificial Intelligence, Santa Clara University*
+
+Email: cole03roberts@gmail.com
+
+LinkedIn: https://www.linkedin.com/in/cole03roberts/
+
+---
+
+## Acknowledgments
+
+Kraken Pro and Coinbase Advanced Trade APIs for market data and execution.
+Amazon Chronos, LightGBM, scikit-learn, and Textual.
+Built with Claude Code.
